@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.aivoiceinput.desktop.speech-helper</string>
+  <key>CFBundleName</key>
+  <string>AI Voice Input Speech Helper</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>AI Voice Input uses macOS speech recognition to transcribe your recordings.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>AI Voice Input records microphone audio for transcription.</string>
+</dict>
+</plist>

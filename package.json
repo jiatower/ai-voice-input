@@ -1,0 +1,102 @@
+{
+  "name": "ai-voice-input",
+  "version": "0.1.0",
+  "description": "AI Voice Input desktop assistant",
+  "main": "dist/main/main.js",
+  "author": "AI Voice Input",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "electron:dev": "concurrently -k \"npm:dev\" \"wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build": "python3 scripts/generate_icons.py && bash scripts/build_macos_speech.sh && bash scripts/build_hotkey_watcher.sh && vite build && tsc -p tsconfig.main.json && node scripts/copy_static.mjs",
+    "package:check": "bash scripts/package.sh check",
+    "package:build": "bash scripts/package.sh build",
+    "package:app": "bash scripts/package.sh app",
+    "dist": "bash scripts/package.sh fast",
+    "dist:signed": "bash scripts/package.sh signed",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.main.json --noEmit"
+  },
+  "dependencies": {
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.24",
+    "@types/react": "^19.1.6",
+    "@types/react-dom": "^19.1.5",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^4.5.0",
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^36.3.1",
+    "electron-builder": "^26.0.12",
+    "lucide-react": "^0.511.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "wait-on": "^8.0.3"
+  },
+  "build": {
+    "appId": "com.aivoiceinput.desktop",
+    "productName": "AI Voice Input",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/icon.png",
+        "to": "build/icon.png"
+      },
+      {
+        "from": "build/icon.icns",
+        "to": "build/icon.icns"
+      },
+      {
+        "from": "build/trayTemplate.png",
+        "to": "build/trayTemplate.png"
+      },
+      {
+        "from": "build/trayTemplate@2x.png",
+        "to": "build/trayTemplate@2x.png"
+      },
+      {
+        "from": "build/helpers/MacSpeechTranscriber.app",
+        "to": "helpers/MacSpeechTranscriber.app"
+      },
+      {
+        "from": "build/helpers/HotkeyWatcher",
+        "to": "helpers/HotkeyWatcher"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "build/icon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "hardenedRuntime": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "AI Voice Input needs microphone access to record your voice for transcription.",
+        "NSSpeechRecognitionUsageDescription": "AI Voice Input uses macOS speech recognition to transcribe recordings without requiring a separate speech engine.",
+        "NSUserNotificationUsageDescription": "AI Voice Input uses notifications for voice answers and delivery status.",
+        "LSUIElement": false
+      }
+    },
+    "dmg": {
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    }
+  }
+}
