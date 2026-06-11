@@ -118,6 +118,109 @@ nav button:hover {
   gap: 18px;
 }
 
+/* 保存状态指示器（右上角"已保存"绿点 / "保存中"灰点） */
+.saveIndicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  color: #667085;
+  background: #f2f4f7;
+  transition: background 0.2s, color 0.2s;
+}
+.saveIndicator .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #98a2b3;
+  transition: background 0.2s, box-shadow 0.2s;
+}
+.saveIndicator.saved {
+  color: #027a48;
+  background: #ecfdf3;
+}
+.saveIndicator.saved .dot {
+  background: #12b76a;
+  box-shadow: 0 0 0 3px rgba(18, 183, 106, 0.15);
+}
+.saveIndicator.saving {
+  color: #b54708;
+  background: #fffaeb;
+}
+.saveIndicator.saving .dot {
+  background: #f79009;
+  animation: savePulse 1.2s ease-in-out infinite;
+}
+@keyframes savePulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.85); }
+}
+
+/* 词库快捷键 toast（在右下角短暂弹出） */
+.vocabToast {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  padding: 12px 18px;
+  background: #1f2937;
+  color: #f9fafb;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  font-size: 14px;
+  font-weight: 500;
+  z-index: 9999;
+  animation: vocabToastIn 0.18s ease-out;
+}
+@keyframes vocabToastIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* 系统硬约束展示区（提示词页润色 textarea 下方） */
+.systemGuard {
+  margin-top: -8px;
+  margin-bottom: 14px;
+  border: 1px solid #eaecf0;
+  border-radius: 10px;
+  background: #f9fafb;
+  overflow: hidden;
+}
+.systemGuard summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #475467;
+  user-select: none;
+  list-style: none;
+}
+.systemGuard summary::-webkit-details-marker {
+  display: none;
+}
+.systemGuard summary .chevron {
+  transition: transform 0.2s;
+  color: #98a2b3;
+}
+.systemGuard[open] summary .chevron {
+  transform: rotate(90deg);
+}
+.systemGuard .guardText {
+  margin: 0;
+  padding: 0 14px 14px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #475467;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
 h1,
 h2,
 p {
@@ -454,6 +557,36 @@ textarea:focus {
   gap: 14px;
   min-width: 0;
   max-width: 820px;
+}
+
+.promptTabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid #eaecf0;
+  margin-bottom: 4px;
+}
+.promptTabs button {
+  background: transparent;
+  border: none;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #667085;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  transition: color 0.15s, border-color 0.15s;
+}
+.promptTabs button:hover {
+  color: #18202f;
+}
+.promptTabs button.active {
+  color: #2563eb;
+  border-bottom-color: #2563eb;
+}
+.promptTabPane {
+  display: grid;
+  gap: 14px;
 }
 
 .logsPanel {

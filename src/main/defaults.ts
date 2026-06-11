@@ -10,7 +10,6 @@ export type AppStatus =
 export type ShortcutConfig = {
   dictation: string;
   question: string;
-  vocabulary: string;
 };
 
 export type ModelConfig = {
@@ -50,9 +49,12 @@ export type PromptProfile = {
 export type VocabularyEntry = {
   id: string;
   term: string;
-  aliases: string;
   enabled: boolean;
   source?: "manual" | "correction";
+  /** 建条时间戳（毫秒）。用于清理老词、排序。 */
+  createdAt?: number;
+  /** 被润色命中的次数（自动学习用，质量分）。 */
+  hitCount?: number;
 };
 
 export type AppConfig = {
@@ -77,8 +79,12 @@ export type AppConfig = {
  * 作用是防止 LLM 把"待整理的转写文本"当成"用户提出的问题"来回答。
  *
  * 用户自定义的 prompt 不会被这段覆盖——只在默认 profile 上拼接。
+ *
+ * 末尾的 /*POLISH_GUARD:hash*\/ 标记用于：
+ * 1. 迁移老数据时检测"已包含硬约束"的 prompt，剥离出纯用户文本
+ * 2. 防止重复叠加（如果调用方手动包了，硬约束模块会跳过）
  */
-export const POLISH_GUARD_PREFIX = `【任务定义】
+const _POLISH_GUARD_BODY = `【任务定义】
 你正在处理一段用户通过语音实时转写出来的文本草稿。这不是用户向你提出的问题，也不是需要你回应的话题。
 用户说这段话的目的是让软件把它整理好后，自动填回到他正在打字的位置（例如聊天框、文档、代码编辑器）。
 你的工作对象是"要被整理的原材料"，不是"要被回答的输入"。
@@ -104,11 +110,128 @@ export const POLISH_GUARD_PREFIX = `【任务定义】
 `;
 
 /**
+ * 硬约束前缀的 hash 标记，基于内容前 32 字符算 6 位 hex。
+ * 改 _POLISH_GUARD_BODY 就会让 hash 变化，老数据里旧 hash 不会被误剥。
+ */
+const POLISH_GUARD_HASH = (() => {
+  let h = 0;
+  for (let i = 0; i < _POLISH_GUARD_BODY.length; i++) {
+    h = (h * 31 + _POLISH_GUARD_BODY.charCodeAt(i)) | 0;
+  }
+  // 转成 6 位 hex
+  const hex = (h >>> 0).toString(16).padStart(8, "0").slice(0, 6);
+  return hex;
+})();
+
+/** 完整的硬约束前缀（含 hash 标记），供调用方拼接到 system prompt 头部。 */
+export const POLISH_GUARD_PREFIX = `${_POLISH_GUARD_BODY}/*POLISH_GUARD:${POLISH_GUARD_HASH}*/\n`;
+
+/** 纯硬约束文本（不含 hash 标记），用于 UI 展示给用户看"系统会自动加什么"。 */
+export const POLISH_GUARD_DISPLAY = _POLISH_GUARD_BODY.trim();
+
+/**
  * 包装用户自定义的润色提示词，注入硬约束前缀。
  * 默认出厂 prompt 会被加上前缀；用户后续在 UI 里改过的 prompt 也走这里统一处理。
  */
 export function withPolishGuard(userPrompt: string): string {
   return POLISH_GUARD_PREFIX + userPrompt;
+}
+
+/**
+ * 硬约束的特征开头：用于识别"无 hash 标记的老硬约束段"。
+ * 只要文本以这段开头，就当作一段硬约束，可以整段剥掉。
+ */
+const POLISH_GUARD_CONTENT_PREFIX =
+  "【任务定义】\n你正在处理一段用户通过语音实时转写出来的文本草稿。";
+
+/**
+ * 剥离开头可能存在的硬约束前缀，返回"纯用户提示词"。
+ *
+ * 用于迁移老数据：老用户存的 polish 可能是"硬约束 + 风格"的拼接形式，
+ * 甚至多次保存后变成"硬约束 + 硬约束 + … + 风格"的堆叠，加载时需要全部剥掉，
+ * 只保留最后的"风格"部分，方便用户在 UI 上编辑、避免误以为可以改硬约束。
+ *
+ * 识别方式（按优先级）：
+ * 1. 带 hash 标记（新版）→ 用 hash 匹配，匹配上就剥
+ * 2. 不带 hash 标记但内容是硬约束正文（老版）→ 用内容前缀匹配
+ * 3. 反复剥，直到开头不是硬约束为止（处理堆叠）
+ * 4. 都没匹配上 → 原样返回（保守）
+ */
+export function stripPolishGuard(prompt: string): string {
+  if (!prompt) return prompt;
+  let current = prompt;
+
+  // 最多剥 32 层（防止意外死循环，老数据里最多见过 5 层堆叠）
+  for (let i = 0; i < 32; i++) {
+    const trimmed = current.replace(/^\s+/, "");
+    let removed = false;
+
+    // 方式 1：开头就是 hash 标记（POLISH_GUARD_PREFIX 可能在前面，但调用方拼接时
+    // 通常是 "硬约束正文 + 标记 + 风格" 的形式，所以这里其实是罕见情况。
+    // 真正常见的是方式 2：开头是硬约束正文，紧跟标记）。
+    const markerMatch = trimmed.match(/^\/\*POLISH_GUARD:([a-f0-9]+)\*\//);
+    if (markerMatch) {
+      if (markerMatch[1] === POLISH_GUARD_HASH) {
+        // 标记匹配：剥掉标记本身 + 紧随其后的空白
+        current = trimmed.substring(markerMatch[0].length).replace(/^\s+/, "");
+        removed = true;
+      } else {
+        // 标记不匹配（理论上不该发生）→ 保守不剥，退出循环
+        break;
+      }
+    } else if (trimmed.startsWith(POLISH_GUARD_CONTENT_PREFIX)) {
+      // 方式 2：开头是硬约束正文（POLISH_GUARD_PREFIX = 正文 + 末尾的 hash 标记）
+      // 剥掉整段硬约束（用 _stripOneGuardBody 定位结尾）
+      const withoutGuard = _stripOneGuardBody(trimmed);
+      if (withoutGuard !== trimmed) {
+        let afterGuard = withoutGuard.replace(/^\s+/, "");
+        // 关键修复：剥完硬约束正文后，如果紧接着就是 /*POLISH_GUARD:hash*/ 标记，
+        // 也要把它一起吃掉（不然它会漏到用户可见的 UI 里）。
+        const trailingMarker = afterGuard.match(/^\/\*POLISH_GUARD:([a-f0-9]+)\*\//);
+        if (trailingMarker) {
+          if (trailingMarker[1] === POLISH_GUARD_HASH) {
+            afterGuard = afterGuard.substring(trailingMarker[0].length).replace(/^\s+/, "");
+          }
+          // 标记不匹配时保守地保留（理论上不该发生）
+        }
+        current = afterGuard;
+        removed = true;
+      }
+    }
+
+    if (!removed) break;
+  }
+
+  return current.trim();
+}
+
+/**
+ * 剥掉一段硬约束正文（无 hash 标记），返回剩余文本。
+ *
+ * 硬约束正文的结构（见 _POLISH_GUARD_BODY）：
+ *   【任务定义】...【绝对禁止】...【允许的操作】...【输出格式】...
+ * 末尾是 "如果转写文本本身就是空的或没有意义，输出空字符串。" 后面跟两个换行。
+ *
+ * 我们用更稳的"段落边界"来定位：找到这个标志性结尾句 + 随后的空白行，
+ * 剥掉从开头到那里为止的全部内容。处理堆叠时：如果紧接着又是硬约束开头，
+ * 外层循环会再次识别并剥掉。
+ */
+function _stripOneGuardBody(text: string): string {
+  // 硬约束正文最末尾的标志句
+  const endMarker = "如果转写文本本身就是空的或没有意义，输出空字符串。";
+  const endIdx = text.indexOf(endMarker);
+  if (endIdx < 0) return text;
+
+  // 从 endIdx 开始找到下一个"非空白字符"。硬约束正文结束后，要么是空行 + 真正的
+  // 风格内容，要么直接是另一段硬约束（【任务定义】开头）。
+  // 我们把 endMarker + 它后面的所有空白 + 换行 一起剥掉。
+  let cursor = endIdx + endMarker.length;
+  // 吃掉所有换行和空白（包含空行），直到第一个非空白字符
+  while (cursor < text.length && /\s/.test(text[cursor])) {
+    cursor++;
+  }
+  if (cursor >= text.length) return "";
+  return text.substring(cursor);
 }
 
 export const defaultPrompts: PromptConfig = {
@@ -421,8 +544,7 @@ export const modelPresets: Record<string, Partial<ModelConfig>> = {
 export const defaultConfig: AppConfig = {
   shortcuts: {
     dictation: "Control+Shift+Space",
-    question: "Control+Shift+.",
-    vocabulary: "Control+Shift+V"
+    question: "Control+Shift+."
   },
   model: {
     provider: "none",
@@ -445,31 +567,54 @@ export const defaultConfig: AppConfig = {
     apiSecret: "ZTlhOTEzMWQyNjRmMTBhNGY4NjRiZjc1"
   },
   prompts: defaultPrompts,
-  correctionPrompt: "你是语音识别纠错助手。对比用户提供的两段文本，找出所有被修正的词汇或短语。只输出 JSON 数组，不要任何解释。",
+  correctionPrompt: `你是语音识别纠错助手，专职发现"因发音相近被识别错"的短词。
+
+【你要找的修正对特征】
+- 由语音识别听错造成，不是语义改写、不是润色。
+- 长度极短：1-6 个汉字，或 1-3 个英文单词。超出这个范围直接忽略。
+- wrong（被听错）和 correct（修正后）发音相近（声母/韵母/音节数相似）。
+
+【只接受这些典型情形】
+- 同音/近音字：测肖→测销、配置→配值、式样→一样
+- 音近词：FC→EF、Marvis→Mavis、API→A P I
+- 一字/一词之差：Mavis Code→Mavis Code
+
+【严格拒绝】
+- 整句修正对（任何超过 6 汉字 / 3 单词的）
+- 语义改写（"测销渠道→销售渠道"、"我们去吃饭→我们去吃午饭"）
+- 通用词（我们、他们、这个、那个、可以、需要）
+- 含"的/了/是/在/和/与/或/但/而/就/也/还/都/会/能"等虚词
+- wrong 与 correct 完全相同
+- 任何非中文/非英文/含标点的词
+
+【输出格式】
+仅输出 JSON 数组：[{"wrong":"...","correct":"..."}]
+无任何修正对时输出 []。
+不要解释、不要 markdown、不要代码块标记。`,
   promptProfiles: promptProfiles,
   activePromptProfileId: promptProfiles[0].id,
   vocabulary: [
-    { id: "voc-1", term: ".env", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-2", term: "适趣", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-3", term: "FC", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-4", term: "gen_messages", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-5", term: "有泳道1", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-6", term: "private_messages", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-7", term: "gen_class_sop", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-8", term: "message_list", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-9", term: "HTTPS", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-10", term: "mock", aliases: "Mock", enabled: true, source: "manual" },
-    { id: "voc-11", term: "测销", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-12", term: "no_effect", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-13", term: "SAE", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-14", term: "MR", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-15", term: "json", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-16", term: "debug", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-17", term: "Codex", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-18", term: "Mavis", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-19", term: "Trae", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-20", term: "OpenCode", aliases: "", enabled: true, source: "manual" },
-    { id: "voc-21", term: "coze", aliases: "", enabled: true, source: "manual" },
+    { id: "voc-1", term: ".env", enabled: true, source: "manual" },
+    { id: "voc-2", term: "适趣", enabled: true, source: "manual" },
+    { id: "voc-3", term: "FC", enabled: true, source: "manual" },
+    { id: "voc-4", term: "gen_messages", enabled: true, source: "manual" },
+    { id: "voc-5", term: "有泳道1", enabled: true, source: "manual" },
+    { id: "voc-6", term: "private_messages", enabled: true, source: "manual" },
+    { id: "voc-7", term: "gen_class_sop", enabled: true, source: "manual" },
+    { id: "voc-8", term: "message_list", enabled: true, source: "manual" },
+    { id: "voc-9", term: "HTTPS", enabled: true, source: "manual" },
+    { id: "voc-10", term: "mock", enabled: true, source: "manual" },
+    { id: "voc-11", term: "测销", enabled: true, source: "manual" },
+    { id: "voc-12", term: "no_effect", enabled: true, source: "manual" },
+    { id: "voc-13", term: "SAE", enabled: true, source: "manual" },
+    { id: "voc-14", term: "MR", enabled: true, source: "manual" },
+    { id: "voc-15", term: "json", enabled: true, source: "manual" },
+    { id: "voc-16", term: "debug", enabled: true, source: "manual" },
+    { id: "voc-17", term: "Codex", enabled: true, source: "manual" },
+    { id: "voc-18", term: "Mavis", enabled: true, source: "manual" },
+    { id: "voc-19", term: "Trae", enabled: true, source: "manual" },
+    { id: "voc-20", term: "OpenCode", enabled: true, source: "manual" },
+    { id: "voc-21", term: "coze", enabled: true, source: "manual" },
   ],
   autoLearn: true,
   reviewBeforePaste: false,

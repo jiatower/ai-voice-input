@@ -25,7 +25,12 @@
 
       ipcRenderer.on("recorder:start", async () => {
         try {
-          if (processor) return;
+          // 幂等：如果上一次录音还没结束，先清理掉，避免状态卡住
+          if (processor) {
+            try { processor.disconnect(); } catch {}
+            try { source?.disconnect(); } catch {}
+            processor = null;
+          }
           chunks = [];
           await prepareRecorder();
           await audioContext.resume();
@@ -37,12 +42,14 @@
           processor.connect(audioContext.destination);
           ipcRenderer.send("recorder:started");
         } catch (error) {
+          // 启动失败也要清理状态，避免下次被卡住的 processor 拦住
+          await resetRecorder();
           ipcRenderer.send("recorder:error", error?.message || String(error));
         }
       });
 
       ipcRenderer.on("recorder:stop", () => {
-        stopRecording();
+        void stopRecording();
       });
 
       ipcRenderer.on("recorder:reset", async () => {
@@ -87,11 +94,26 @@
       }
 
       async function stopRecording() {
-        if (!audioContext || !processor) return;
+        // 兜底：processor 没建好或音频上下文已关闭，也要发一个 recorder:stopped，
+        // 否则主进程会永远卡在 "recording" 状态。
+        if (!audioContext || !processor) {
+          ipcRenderer.send("recorder:stopped", {
+            bytes: [],
+            mimeType: "audio/wav",
+            empty: true,
+            reason: !audioContext ? "no-context" : "no-processor"
+          });
+          return;
+        }
         const sampleRate = audioContext.sampleRate;
-        processor?.disconnect();
-        source?.disconnect();
-        await new Promise((r) => setTimeout(r, 300));
+        try { processor.disconnect(); } catch {}
+        try { source?.disconnect(); } catch {}
+        // 300ms 是给最后一次 onaudioprocess 把数据 flush 完的时间，但加超时兜底
+        // 防止 await 永远卡住（比如 audioContext 异常）
+        await Promise.race([
+          new Promise((r) => setTimeout(r, 300)),
+          new Promise((r) => setTimeout(r, 1500))
+        ]);
         const wav = encodeWav(chunks, sampleRate);
         processor = null;
         ipcRenderer.send("recorder:stopped", {

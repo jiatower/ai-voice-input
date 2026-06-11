@@ -16,7 +16,15 @@ import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { loadConfig, saveConfig } from "./config";
-import { AppConfig, AppStatus, appStyleMap, defaultPrompts, modelPresets } from "./defaults";
+import {
+  AppConfig,
+  AppStatus,
+  appStyleMap,
+  defaultPrompts,
+  modelPresets,
+  POLISH_GUARD_DISPLAY,
+  POLISH_GUARD_PREFIX
+} from "./defaults";
 import { startHotkeyWatcher, stopHotkeyWatcher } from "./hotkeys";
 import { clearLogs, getLogPath, readLogs, writeLog } from "./logger";
 import {
@@ -52,6 +60,11 @@ let recorderReady = false;
 let stopRequestedWhileStarting = false;
 let recordingStartSent = false;
 const pendingRecorderMessages: Array<{ channel: string; payload?: unknown }> = [];
+// globalShortcut 在 macOS 上有时会在一次按键里触发两次 down 事件（相隔 1-3ms），
+// 用来去抖：相同 mode 在 DEBOUNCE_MS 内重复触发，直接忽略。
+const DEBOUNCE_MS = 80;
+let lastDownAt = 0;
+let lastDownMode: "dictation" | "question" | null = null;
 
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
 
@@ -118,8 +131,13 @@ function createMainWindow() {
   mainWindow = new BrowserWindow({
     width: 1160,
     height: 820,
-    minWidth: 960,
-    minHeight: 660,
+    minWidth: 1160,
+    minHeight: 820,
+    maxWidth: 1160,
+    maxHeight: 820,
+    resizable: false,
+    maximizable: false,
+    fullscreenable: false,
     title: "AI Voice Input",
     backgroundColor: "#f7f8fb",
     icon: assetPath("icon.png"),
@@ -492,39 +510,172 @@ function positionQaWindow(width: number, height: number) {
   );
 }
 
-function extractCorrections(original: string, edited: string): Array<{ original: string; corrected: string }> {
+// ─────────────────────────────────────────────────────────────────────────────
+// 词库自动学习：从"原转写 vs 修正后"中提取因"语音听错"造成的修正对。
+// 设计目标：只收"发音相近的短词"，拒绝整句、拒绝语义改写、拒绝通用词。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 长度上限：1-6 个汉字 或 1-3 个英文单词。 */
+const MAX_CN_LENGTH = 6;
+const MAX_EN_WORDS = 3;
+
+/** 必被拒绝的虚词 / 通用词 —— 即便发音相似也不应收。 */
+const STOP_CHARS = new Set([
+  "的", "了", "是", "在", "和", "与", "或", "但", "而", "就",
+  "也", "还", "都", "会", "能", "要", "有", "我", "你", "他",
+  "她", "它", "们", "这", "那", "哪", "什么", "怎么", "为什么",
+  "可以", "需要", "应该", "可能", "一个", "一些", "这个", "那个",
+  "我们", "你们", "他们", "它们", "自己", "知道", "觉得", "认为"
+]);
+
+/** 判断一个词是否"中文"。 */
+function isChineseToken(s: string): boolean {
+  return /^[一-鿿㐀-䶿豈-﫿]+$/.test(s);
+}
+
+/** 判断一个词是否"纯英文/数字"。 */
+function isAlphaNumToken(s: string): boolean {
+  return /^[a-zA-Z0-9]+$/.test(s);
+}
+
+/**
+ * 校验一个修正对（wrong/correct）是否符合"可入词库"标准。
+ * 返回 null 表示拒绝；返回原样对象表示通过。
+ */
+function validateVocabPair(
+  wrong: string,
+  correct: string
+): { original: string; corrected: string } | null {
+  const w = wrong.trim();
+  const c = correct.trim();
+  if (!w || !c || w === c) return null;
+
+  // 1. 形态：必须都是"纯中文"或"纯英文/数字"，不接受混合
+  const wIsCn = isChineseToken(w);
+  const cIsCn = isChineseToken(c);
+  const wIsEn = isAlphaNumToken(w);
+  const cIsEn = isAlphaNumToken(c);
+  if (wIsCn !== cIsCn) return null; // 中英混搭拒收
+  if (!wIsCn && !wIsEn) return null; // 既不是中文也不是英文，拒
+
+  // 2. 长度上限
+  if (wIsCn && (w.length > MAX_CN_LENGTH || c.length > MAX_CN_LENGTH)) return null;
+  if (wIsEn) {
+    const wWords = w.split(/\s+/).filter(Boolean).length;
+    const cWords = c.split(/\s+/).filter(Boolean).length;
+    if (wWords > MAX_EN_WORDS || cWords > MAX_EN_WORDS) return null;
+    if (w.length > 24 || c.length > 24) return null; // 英文总字符兜底
+  }
+
+  // 3. 长度下限：1 字的"修正对"几乎都是噪声，拒
+  if (wIsCn && (w.length < 2 || c.length < 2)) return null;
+  if (wIsEn && (w.length < 2 || c.length < 2)) return null;
+
+  // 4. 拒虚词/通用词（整词命中即拒，单字命中即拒）
+  if (STOP_CHARS.has(w) || STOP_CHARS.has(c)) return null;
+  for (const ch of w + c) {
+    if (STOP_CHARS.has(ch)) return null;
+  }
+
+  // 5. 大小写归一
+  const wrongNorm = wIsEn ? w.toLowerCase() : w;
+  const correctNorm = wIsEn ? c.toLowerCase() : c;
+  if (wrongNorm === correctNorm) return null;
+
+  return { original: wrongNorm, corrected: correctNorm };
+}
+
+/**
+ * 字符串相似度：1 - 归一化编辑距离。
+ * 1.0 表示完全相同，0.0 表示完全不同。用于快速判定两个短词是否"形态接近"。
+ */
+function similarity(a: string, b: string): number {
+  if (a === b) return 1;
+  if (!a.length || !b.length) return 0;
+  const maxLen = Math.max(a.length, b.length);
+  // Levenshtein 距离（空间优化版）
+  const prev: number[] = Array.from({ length: b.length + 1 }, (_, i) => i);
+  const curr: number[] = new Array(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+    }
+    for (let j = 0; j <= b.length; j++) prev[j] = curr[j];
+  }
+  return 1 - prev[b.length] / maxLen;
+}
+
+/**
+ * 用位置对齐 + 滑窗 + 相似度，从两段文本中提取可疑的"短词修正对"。
+ * 设计原则：宁少勿多，漏掉的可让 LLM 补，过滤掉的就别再放出来。
+ */
+function extractCorrections(original: string, edited: string): string[] {
   if (original === edited) return [];
-  const tokenize = (text: string) => {
+  // 按字 + 英文/数字连续段切分
+  const tokenize = (text: string): string[] => {
     const tokens: string[] = [];
-    const regex = /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]+|[a-zA-Z0-9]+/g;
+    const regex = /[一-鿿㐀-䶿豈-﫿]|[a-zA-Z0-9]+/g;
     let match: RegExpExecArray | null;
     while ((match = regex.exec(text)) !== null) tokens.push(match[0]);
     return tokens;
   };
   const orig = tokenize(original);
   const edit = tokenize(edited);
-  const maxLen = Math.max(orig.length, edit.length);
-  const pairs: Array<{ original: string; corrected: string }> = [];
-  for (let i = 0; i < maxLen; i++) {
-    const o = (orig[i] || "").toLowerCase();
-    const e = (edit[i] || "").toLowerCase();
-    if (o === e) continue;
-    if (o.length < 2 || e.length < 2) continue;
-    if (e.length < 3 && /^[a-z]+$/i.test(e)) continue;
-    const shorter = o.length < e.length ? o : e;
-    const longer = o.length < e.length ? e : o;
-    let common = 0;
-    for (let j = 0; j < shorter.length; j++) { if (longer.includes(shorter[j])) common += 1; }
-    if (common / longer.length > 0.5 || (shorter.length >= 3 && longer.length < 8)) {
-      pairs.push({ original: orig[i] || "", corrected: edit[i] || "" });
+  const terms: string[] = [];
+
+  // 滑窗：尝试 1-N 字的修正对
+  const maxWindow = 6; // 最多尝试 6 字窗
+  let ei = 0;
+  for (let oi = 0; oi < orig.length && ei < edit.length; oi++) {
+    let matched = false;
+    // 先尝试等长匹配：1-3 个 token / 1-6 个字
+    for (let w = 1; w <= maxWindow && oi + w <= orig.length && ei + w <= edit.length; w++) {
+      const oSlice = orig.slice(oi, oi + w).join("");
+      const eSlice = edit.slice(ei, ei + w).join("");
+      const sim = similarity(oSlice.toLowerCase(), eSlice.toLowerCase());
+      // 形态相近但不完全相同
+      if (sim >= 0.5 && sim < 1.0) {
+        const validated = validateVocabPair(oSlice, eSlice);
+        if (validated) {
+          terms.push(validated.corrected);
+          ei += w;
+          oi += w - 1; // for 循环还会 +1
+          matched = true;
+          break;
+        }
+      }
+    }
+    if (!matched) {
+      // 不同长度：尝试 1 个原文 token 对 N 个修正 token（N=1..3）
+      const oTok = orig[oi];
+      for (let w = 1; w <= 3 && ei + w <= edit.length; w++) {
+        const eSlice = edit.slice(ei, ei + w).join("");
+        const v = validateVocabPair(oTok, eSlice);
+        if (v) {
+          const sim = similarity(oTok.toLowerCase(), eSlice.toLowerCase());
+          if (sim >= 0.4 && sim < 1.0) {
+            terms.push(v.corrected);
+            ei += w;
+            oi += 0; // 跳过 0 个 orig
+            matched = true;
+            break;
+          }
+        }
+      }
+      if (!matched) {
+        ei += 1; // 修正侧前进 1，丢一个 token
+      }
     }
   }
-  return pairs;
+  return Array.from(new Set(terms));
 }
 
-async function findCorrectionsByAI(original: string, edited: string): Promise<Array<{ original: string; corrected: string }>> {
-  const pairs = extractCorrections(original, edited);
-  if (config.model.provider === "none" || !config.model.apiKey) return pairs;
+async function findCorrectionsByAI(original: string, edited: string): Promise<string[]> {
+  // 简单比对产出的"修正后的词"列表
+  const localTerms = extractCorrections(original, edited);
+  if (config.model.provider === "none" || !config.model.apiKey) return localTerms;
 
   try {
     const response = await callChatModel(
@@ -533,53 +684,53 @@ async function findCorrectionsByAI(original: string, edited: string): Promise<Ar
       `原文本：${original}\n修正后：${edited}\n\n请找出所有被修正过的词汇对。格式：[{"wrong":"错词","correct":"正确词"}]，如果相同则输出 []`
     );
     const jsonMatch = response.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) return pairs;
+    if (!jsonMatch) return localTerms;
     const items = JSON.parse(jsonMatch[0]) as Array<{ wrong?: string; correct?: string }>;
-    const aiPairs = items
-      .filter((item) => item.wrong && item.correct && item.wrong !== item.correct)
-      .map((item) => ({ original: item.wrong!, corrected: item.correct! }));
-    if (aiPairs.length === 0) return pairs;
+    // LLM 返回的修正对，过 validateVocabPair 拿到 corrected（即"应该学的词"）
+    const aiTerms = items
+      .map((item) => {
+        if (!item.wrong || !item.correct) return null;
+        const v = validateVocabPair(item.wrong, item.correct);
+        return v ? v.corrected : null;
+      })
+      .filter((t): t is string => t !== null);
+    if (aiTerms.length === 0) return localTerms;
 
-    const deduped = aiPairs.filter((ai) =>
-      !pairs.some((p) => p.original === ai.original && p.corrected === ai.corrected)
-    );
-    writeLog("info", "vocabulary", "AI 辅助纠错", { simple: pairs.length, ai: aiPairs.length, merged: pairs.length + deduped.length });
-    return [...pairs, ...deduped];
+    const deduped = aiTerms.filter((t) => !localTerms.includes(t));
+    writeLog("info", "vocabulary", "AI 辅助纠错", {
+      simple: localTerms.length,
+      ai: aiTerms.length,
+      merged: localTerms.length + deduped.length
+    });
+    return [...localTerms, ...deduped];
   } catch (error) {
     writeLog("warn", "vocabulary", "AI 纠错调用失败，使用简单比对", { error: String(error) });
-    return pairs;
+    return localTerms;
   }
 }
 
-async function mergeCorrections(pairs: Array<{ original: string; corrected: string }>) {
-  if (pairs.length === 0) return;
+async function mergeCorrections(terms: string[]) {
+  if (terms.length === 0) return;
   config = loadConfig();
   let changed = false;
-  for (const pair of pairs) {
-    const dup = config.vocabulary.find(
-      (v) => v.term === pair.corrected && v.aliases === pair.original
-    );
-    if (dup) continue;
-    const existing = config.vocabulary.find((v) => v.term === pair.corrected);
-    if (existing) {
-      if (!existing.aliases.includes(pair.original)) {
-        existing.aliases = [existing.aliases, pair.original].filter(Boolean).join(",");
-        changed = true;
-      }
-    } else {
-      config.vocabulary.push({
-        id: crypto.randomUUID(),
-        term: pair.corrected,
-        aliases: pair.original,
-        enabled: config.autoLearn,
-        source: "correction"
-      });
-      changed = true;
-    }
+  const now = Date.now();
+  for (const term of terms) {
+    const t = term.trim();
+    if (!t) continue;
+    if (config.vocabulary.some((v) => v.term === t)) continue; // 已存在 term 则跳过
+    config.vocabulary.push({
+      id: `voc-auto-${now}-${Math.random().toString(36).slice(2, 8)}`,
+      term: t,
+      enabled: config.autoLearn,
+      source: "correction",
+      createdAt: now,
+      hitCount: 0
+    });
+    changed = true;
   }
   if (changed) {
     config = await saveConfig(config);
-    writeLog("info", "vocabulary", "\u81ea\u52a8\u6dfb\u52a0\u7ea0\u6b63\u8bcd\u6761", { count: pairs.length, autoLearn: config.autoLearn });
+    writeLog("info", "vocabulary", "自动添加词条", { count: terms.length, autoLearn: config.autoLearn });
     broadcast("config:changed", config);
   }
 }
@@ -658,7 +809,6 @@ function registerShortcuts() {
   // 同时注册 globalShortcut 以消耗快捷键事件，防止 Ctrl+Q 等系统快捷键被透传
   safeRegister("dictation", config.shortcuts.dictation, () => { /* handled by hotkey watcher */ });
   safeRegister("question", config.shortcuts.question, () => { /* handled by hotkey watcher */ });
-  safeRegister("vocabulary", config.shortcuts.vocabulary, showMainWindow);
 
   writeLog(Object.values(results).every(Boolean) ? "info" : "warn", "shortcuts", "快捷键注册完成", {
     shortcuts: config.shortcuts,
@@ -730,6 +880,15 @@ async function getFrontmostApp(): Promise<string> {
 }
 
 async function startRecording(mode: "dictation" | "question") {
+  // 去抖：globalShortcut 偶发会在一次按键里触发两次 down，相隔 1-3ms，
+  // 如果和上一次是同一 mode，直接 return 避免状态闪烁。
+  const now = Date.now();
+  if (lastDownMode === mode && now - lastDownAt < DEBOUNCE_MS) {
+    writeLog("debug", "shortcut", "忽略去抖窗口内的重复按下", { mode, deltaMs: now - lastDownAt });
+    return;
+  }
+  lastDownAt = now;
+  lastDownMode = mode;
   writeLog("info", "shortcut", "按下快捷键", { mode, status });
   recordingFrontApp = "";
   if (config.autoDetectStyle) {
@@ -737,8 +896,26 @@ async function startRecording(mode: "dictation" | "question") {
     writeLog("info", "style", "检测到前台应用", { app: recordingFrontApp });
   }
   if (status !== "idle") {
-    if (status !== "recording" || activeMode !== mode) flashError("当前已有任务正在处理", 1600);
-    return;
+    // 如果上次录音卡在 recording（recorder:stopped 没回来之类的），允许二次按快捷键
+    // 强制清理并重新开始 —— 这是兜底，避免状态机永久卡住。
+    if (status === "recording") {
+      writeLog("warn", "recording", "检测到录音状态卡住，强制重置后重新开始", { activeMode, requestedMode: mode });
+      activeMode = null;
+      recordingStartSent = false;
+      // 让 recorder 窗口也清空
+      sendRecorder("recorder:reset");
+      setStatus("idle", "后台待命");
+      // 不 return，继续往下走正常的启动流程
+    } else if (status === "needs_attention") {
+      // 有错误提示但用户想重试 → 允许继续
+      if (recoveryTimer) {
+        clearTimeout(recoveryTimer);
+        recoveryTimer = null;
+      }
+    } else {
+      flashError("当前已有任务正在处理", 1600);
+      return;
+    }
   }
 
   activeMode = mode;
@@ -795,7 +972,7 @@ function buildVocabularySuffix(): string {
   const enabled = config.vocabulary.filter((v) => v.enabled);
   if (enabled.length === 0) return "";
   const terms = enabled.map((v) => v.term).join("、");
-  return `\n\n请注意不要改错以下专有名词和术语：${terms}`;
+  return `\n\n【用户词库】以下是用户希望被优先使用的专有名词和术语：${terms}\n请基于上下文判断：如果转写文本中存在同义或近义的其他写法（比如同音字、口语化替换、识别错误），**优先**替换为词库中的正确写法；语义不匹配时不要强行替换。`;
 }
 
 async function processAudio(audio: Uint8Array, browserTranscript = "") {
@@ -837,10 +1014,12 @@ async function processAudio(audio: Uint8Array, browserTranscript = "") {
         const tPolishStart = Date.now();
         setStatus("generating", "正在润色文本");
         try {
-          const prompt = getAutoDetectedPrompt();
+          const stylePrompt = getAutoDetectedPrompt();
+          // 硬约束（防"答非所问"）+ 用户风格提示词 + 词库后缀
+          const systemPrompt = POLISH_GUARD_PREFIX + stylePrompt + buildVocabularySuffix();
           finalText = await callChatModel(
             config,
-            prompt + buildVocabularySuffix(),
+            systemPrompt,
             wrapPolishContent(rawText)
           );
           polishMs = Date.now() - tPolishStart;
@@ -981,6 +1160,7 @@ function setupIpc() {
     return true;
   });
   ipcMain.handle("prompts:defaults", () => defaultPrompts);
+  ipcMain.handle("prompts:polish-guard", () => POLISH_GUARD_DISPLAY);
   ipcMain.handle("window:show", showMainWindow);
   ipcMain.handle("logs:list", () => readLogs());
   ipcMain.handle("logs:clear", () => {
@@ -1021,9 +1201,11 @@ function setupIpc() {
     if (!profile) return;
     writeLog("info", "review", "切换润色风格", { styleId, name: profile.name });
     try {
+      // 硬约束 + 风格 + 词库
+      const systemPrompt = POLISH_GUARD_PREFIX + profile.prompts.polish + buildVocabularySuffix();
       const polished = await callChatModel(
         config,
-        profile.prompts.polish + buildVocabularySuffix(),
+        systemPrompt,
         wrapPolishContent(reviewRawText)
       );
       reviewWindow.webContents.send("review:update-text", polished);
@@ -1045,9 +1227,21 @@ function setupIpc() {
     flashError(`录音失败：${message}`);
     notify("录音失败", message);
   });
-  ipcMain.on("recorder:stopped", (_event, payload: number[] | { bytes: number[]; transcript?: string }) => {
-    const bytes = Array.isArray(payload) ? payload : payload.bytes;
-    const transcript = Array.isArray(payload) ? "" : payload.transcript ?? "";
+  ipcMain.on("recorder:stopped", (_event, payload: number[] | { bytes: number[]; transcript?: string; empty?: boolean; reason?: string }) => {
+    // 兜底：无论 recorder 端送回什么，主进程都要保证状态能回到 idle，
+    // 不能再让"录音中"卡住整个状态机。
+    const bytes = Array.isArray(payload) ? payload : (payload?.bytes ?? []);
+    const transcript = Array.isArray(payload) ? "" : (payload?.transcript ?? "");
+    const empty = !Array.isArray(payload) && Boolean(payload?.empty);
+    if (empty) {
+      // recorder 端因为 processor 没建好等原因发了空数据，
+      // 主进程这里不要走讯飞，直接清状态即可。
+      writeLog("warn", "recording", "收到空录音数据，已重置状态", { reason: payload?.reason });
+      activeMode = null;
+      recordingStartSent = false;
+      setStatus("idle", "后台待命");
+      return;
+    }
     processAudio(Uint8Array.from(bytes), transcript);
   });
 }

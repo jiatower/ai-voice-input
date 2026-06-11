@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld("aiVoiceInput", {
   getModelPresets: () => ipcRenderer.invoke("model:presets"),
   testModel: (config: unknown) => ipcRenderer.invoke("model:test", config),
   getDefaultPrompts: () => ipcRenderer.invoke("prompts:defaults"),
+  getPolishGuard: () => ipcRenderer.invoke("prompts:polish-guard"),
   listLogs: () => ipcRenderer.invoke("logs:list"),
   clearLogs: () => ipcRenderer.invoke("logs:clear"),
   getLogPath: () => ipcRenderer.invoke("logs:path"),
@@ -39,5 +40,10 @@ contextBridge.exposeInMainWorld("aiVoiceInput", {
     const listener = (_event: Electron.IpcRendererEvent, config: unknown) => callback(config);
     ipcRenderer.on("config:changed", listener);
     return () => ipcRenderer.removeListener("config:changed", listener);
+  },
+  onVocabularyAdded: (callback: (info: { term: string; duplicate: boolean }) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, info: { term: string; duplicate: boolean }) => callback(info);
+    ipcRenderer.on("vocabulary:added", listener);
+    return () => ipcRenderer.removeListener("vocabulary:added", listener);
   }
 });

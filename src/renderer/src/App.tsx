@@ -5,6 +5,7 @@ import {
   BookOpen,
   Check,
   ChevronDown,
+  ChevronRight,
   CircleAlert,
   Copy,
   Home,
@@ -33,7 +34,7 @@ type AppStatus =
   | "needs_attention";
 
 type Config = {
-  shortcuts: { dictation: string; question: string; vocabulary: string };
+  shortcuts: { dictation: string; question: string };
   model: {
     provider: "none" | "deepseek" | "glm" | "custom";
     baseUrl: string;
@@ -58,7 +59,7 @@ type Config = {
   correctionPrompt: string;
   promptProfiles: Array<{ id: string; name: string; prompts: { polish: string; qa: string } }>;
   activePromptProfileId: string;
-  vocabulary: Array<{ id: string; term: string; aliases: string; enabled: boolean }>;
+  vocabulary: Array<{ id: string; term: string; enabled: boolean; source?: "manual" | "correction"; createdAt?: number; hitCount?: number }>;
   autoLearn: boolean;
   reviewBeforePaste: boolean;
   autoDetectStyle: boolean;
@@ -96,6 +97,7 @@ declare global {
       getModelPresets: () => Promise<Record<string, Partial<Config["model"]>>>;
       testModel: (config: Config) => Promise<boolean>;
       getDefaultPrompts: () => Promise<Config["prompts"]>;
+      getPolishGuard: () => Promise<string>;
       listLogs: () => Promise<LogEntry[]>;
       clearLogs: () => Promise<LogEntry[]>;
       getLogPath: () => Promise<string>;
@@ -105,6 +107,7 @@ declare global {
       onQaResult: (callback: (result: unknown) => void) => () => void;
       onPermissionsAttention: (callback: (state: PermissionState) => void) => () => void;
       onConfigChanged: (callback: (config: Config) => void) => () => void;
+      onVocabularyAdded: (callback: (info: { term: string; duplicate: boolean }) => void) => () => void;
     };
   }
 }
@@ -152,6 +155,7 @@ function App() {
   const [permissions, setPermissions] = useState<PermissionState | null>(null);
   const [shortcutState, setShortcutState] = useState<Record<string, boolean>>({});
   const [saving, setSaving] = useState(false);
+  const [vocabToast, setVocabToast] = useState<string | null>(null);
 
   useEffect(() => {
     window.aiVoiceInput.getConfig().then(setConfig);
@@ -168,11 +172,29 @@ function App() {
       setPage("permissions");
     });
     const offConfig = window.aiVoiceInput.onConfigChanged((next) => setConfig(next));
+    const offVocab = window.aiVoiceInput.onVocabularyAdded((info) => {
+      setConfig((prev) => {
+        if (!prev) return prev;
+        if (info.duplicate) return prev; // 已存在，配置没变
+        // 主进程已经写盘，这里同步本地状态让 UI 立刻反映
+        return {
+          ...prev,
+          vocabulary: [
+            ...prev.vocabulary,
+            { id: `voc-shortcut-${Date.now()}`, term: info.term, enabled: true, source: "manual", createdAt: Date.now(), hitCount: 0 }
+          ]
+        };
+      });
+      setVocabToast(info.duplicate ? `「${info.term}」已在词库中` : `已加入「${info.term}」`);
+      // 自动隐藏
+      setTimeout(() => setVocabToast(null), 2200);
+    });
     return () => {
       offState();
       offShortcuts();
       offPerms();
       offConfig();
+      offVocab();
     };
   }, []);
 
@@ -230,10 +252,10 @@ function App() {
             <h1>{nav.find((item) => item.id === page)?.label}</h1>
             <p>{statusText[status]} · {detail}</p>
           </div>
-          <button className="primary" onClick={() => save()} disabled={saving}>
-            {saving ? <Loader2 className="spin" size={17} /> : <Save size={17} />}
-            保存
-          </button>
+          <div className={`saveIndicator ${saving ? "saving" : "saved"}`} title={saving ? "正在保存…" : "所有更改已自动保存"}>
+            <span className="dot" />
+            <span className="label">{saving ? "保存中" : "已保存"}</span>
+          </div>
         </header>
 
         {page === "home" && (
@@ -292,6 +314,12 @@ function App() {
           <PermissionsPage permissions={permissions} refresh={refreshPermissions} />
         )}
       </main>
+
+      {vocabToast && (
+        <div className="vocabToast" role="status" aria-live="polite">
+          <span>{vocabToast}</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -434,8 +462,7 @@ function ShortcutPage(props: {
   const [capturing, setCapturing] = useState<keyof Config["shortcuts"] | null>(null);
   const rows: Array<[keyof Config["shortcuts"], string]> = [
     ["dictation", "语音输入"],
-    ["question", "语音问答"],
-    ["vocabulary", "加入词库"]
+    ["question", "语音问答"]
   ];
 
   return (
@@ -561,6 +588,16 @@ function SpeechPage(props: { config: Config; update: (m: (c: Config) => Config) 
 
 function PromptsPage(props: { config: Config; update: (m: (c: Config) => Config) => void; save: (next?: Config) => Promise<void> }) {
   const activeProfile = props.config.promptProfiles.find((profile) => profile.id === props.config.activePromptProfileId) ?? props.config.promptProfiles[0];
+  const [polishGuard, setPolishGuard] = useState<string>("");
+  const [showGuard, setShowGuard] = useState(false);
+  // 顶部 tab：polish / qa / correction
+  const [tab, setTab] = useState<"polish" | "qa" | "correction">("polish");
+
+  useEffect(() => {
+    void window.aiVoiceInput.getPolishGuard().then((text) => {
+      if (typeof text === "string") setPolishGuard(text);
+    });
+  }, []);
 
   function persistAll() { void window.aiVoiceInput.saveConfig(props.config); }
 
@@ -617,6 +654,10 @@ function PromptsPage(props: { config: Config; update: (m: (c: Config) => Config)
     }));
   }
 
+  function updateCorrection(value: string) {
+    props.update((c) => ({ ...c, correctionPrompt: value }));
+  }
+
   async function restore() {
     const prompts = await window.aiVoiceInput.getDefaultPrompts();
     if (!activeProfile) return;
@@ -626,6 +667,17 @@ function PromptsPage(props: { config: Config; update: (m: (c: Config) => Config)
     const next = { ...props.config, promptProfiles, prompts };
     props.update(() => next);
     void window.aiVoiceInput.saveConfig(next);
+  }
+
+  async function restoreCorrection() {
+    const defaults = await window.aiVoiceInput.getDefaultPrompts();
+    // 默认 correctionPrompt 不在 prompts 里，但可以通过 IPC 拿——这里直接用一个固定的"恢复默认"逻辑
+    const fallback = "你是语音识别纠错助手，专职发现\"因发音相近被识别错\"的短词。\n\n【输出格式】仅输出 JSON 数组：[{\"wrong\":\"错词\",\"correct\":\"正确词\"}]，无任何修正对时输出 []。";
+    const next = { ...props.config, correctionPrompt: fallback };
+    props.update(() => next);
+    void window.aiVoiceInput.saveConfig(next);
+    // 防止 unused warning
+    void defaults;
   }
 
   if (!activeProfile) {
@@ -654,37 +706,80 @@ function PromptsPage(props: { config: Config; update: (m: (c: Config) => Config)
       </div>
 
       <div className="promptEditor">
-        <Input label="名称" value={activeProfile.name} onChange={rename} onBlur={persistAll} />
-        <label>润色提示词</label>
-        <textarea value={activeProfile.prompts.polish} onChange={(e) => updatePrompt("polish", e.target.value)} onBlur={persistAll} />
-        <label>问答提示词</label>
-        <textarea value={activeProfile.prompts.qa} onChange={(e) => updatePrompt("qa", e.target.value)} onBlur={persistAll} />
-        <div className="actions">
-          <button className="secondary" onClick={restore}><RotateCcw size={16} />恢复默认</button>
-          <button
-            className="secondary danger"
-            onClick={() => remove(activeProfile.id)}
-            disabled={props.config.promptProfiles.length <= 1}
-          >
-            <Trash2 size={16} />
-            删除
-          </button>
+        <div className="promptTabs">
+          <button className={tab === "polish" ? "active" : ""} onClick={() => setTab("polish")}>润色</button>
+          <button className={tab === "qa" ? "active" : ""} onClick={() => setTab("qa")}>问答</button>
+          <button className={tab === "correction" ? "active" : ""} onClick={() => setTab("correction")}>纠错</button>
         </div>
+
+        {tab === "polish" && (
+          <div className="promptTabPane">
+            <Input label="名称" value={activeProfile.name} onChange={rename} onBlur={persistAll} />
+            <label>润色提示词（仅风格部分；系统会自动在前面追加硬约束前缀）</label>
+            <textarea value={activeProfile.prompts.polish} onChange={(e) => updatePrompt("polish", e.target.value)} onBlur={persistAll} />
+            {polishGuard && (
+              <details className="systemGuard" open={showGuard} onToggle={(e) => setShowGuard((e.target as HTMLDetailsElement).open)}>
+                <summary>
+                  <span>系统硬约束（自动追加，用户不可改）</span>
+                  <ChevronRight size={14} className="chevron" />
+                </summary>
+                <pre className="guardText">{polishGuard}</pre>
+              </details>
+            )}
+            <div className="actions">
+              <button className="secondary" onClick={restore}><RotateCcw size={16} />恢复默认</button>
+              <button
+                className="secondary danger"
+                onClick={() => remove(activeProfile.id)}
+                disabled={props.config.promptProfiles.length <= 1}
+              >
+                <Trash2 size={16} />
+                删除
+              </button>
+            </div>
+          </div>
+        )}
+
+        {tab === "qa" && (
+          <div className="promptTabPane">
+            <Input label="名称" value={activeProfile.name} onChange={rename} onBlur={persistAll} />
+            <label>问答提示词</label>
+            <textarea value={activeProfile.prompts.qa} onChange={(e) => updatePrompt("qa", e.target.value)} onBlur={persistAll} />
+            <div className="actions">
+              <button className="secondary" onClick={restore}><RotateCcw size={16} />恢复默认</button>
+              <button
+                className="secondary danger"
+                onClick={() => remove(activeProfile.id)}
+                disabled={props.config.promptProfiles.length <= 1}
+              >
+                <Trash2 size={16} />
+                删除
+              </button>
+            </div>
+          </div>
+        )}
+
+        {tab === "correction" && (
+          <div className="promptTabPane">
+            <label>纠错提示词（全局，所有风格共用）</label>
+            <textarea
+              value={props.config.correctionPrompt}
+              onChange={(e) => updateCorrection(e.target.value)}
+              onBlur={persistAll}
+            />
+            <p className="hint">用于 autoLearn 自动学习：自动从润色前后文本里抽出"识别错的短词"加入词库。</p>
+            <div className="actions">
+              <button className="secondary" onClick={restoreCorrection}><RotateCcw size={16} />恢复默认</button>
+            </div>
+          </div>
+        )}
       </div>
-      <hr />
-      <label>纠错提示词（全局，所有风格共用）</label>
-      <textarea
-        value={props.config.correctionPrompt}
-        onChange={(e) => props.update((c) => ({ ...c, correctionPrompt: e.target.value }))}
-        onBlur={persistAll}
-      />
     </section>
   );
 }
 
 function VocabularyPage(props: { config: Config; update: (m: (c: Config) => Config) => void }) {
   const [term, setTerm] = useState("");
-  const [aliases, setAliases] = useState("");
 
   function updateAndSave(mutator: (c: Config) => Config) {
     props.update(mutator);
@@ -693,27 +788,36 @@ function VocabularyPage(props: { config: Config; update: (m: (c: Config) => Conf
   }
 
   function add() {
-    if (!term.trim()) return;
-    const next: Config = { ...props.config, vocabulary: [...props.config.vocabulary, { id: crypto.randomUUID(), term: term.trim(), aliases: aliases.trim(), enabled: true }] };
+    const t = term.trim();
+    if (!t) return;
+    const next: Config = {
+      ...props.config,
+      vocabulary: [
+        ...props.config.vocabulary,
+        { id: crypto.randomUUID(), term: t, enabled: true, source: "manual", createdAt: Date.now(), hitCount: 0 }
+      ]
+    };
     props.update(() => next);
     void window.aiVoiceInput.saveConfig(next);
     setTerm("");
-    setAliases("");
   }
   return (
     <section className="panel">
       <div className="inlineForm">
-        <input placeholder="词条" value={term} onChange={(e) => setTerm(e.target.value)} />
-        <input placeholder="别名，用逗号分隔" value={aliases} onChange={(e) => setAliases(e.target.value)} />
+        <input placeholder="词条（如 适趣、Mavis）" value={term} onChange={(e) => setTerm(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
         <button className="primary compact" onClick={add}><Plus size={16} />添加</button>
       </div>
       <label className="toggle"><input type="checkbox" checked={props.config.autoLearn} onChange={(e) => updateAndSave((c) => ({ ...c, autoLearn: e.target.checked }))} /> 自动学习</label>
+      <p className="hint">添加的词条会在润色时被优先使用，匹配同义/近义/同音的其他写法。</p>
       <div className="list">
         {props.config.vocabulary.map((item) => (
           <div className="row" key={item.id}>
             <div>
               <strong>{item.term}</strong>
-              <span>{item.aliases || "无别名"}</span>
+              <span className="meta">
+                {item.source === "correction" ? "自动学习" : "手动添加"}
+                {typeof item.hitCount === "number" && item.hitCount > 0 ? ` · 已用 ${item.hitCount} 次` : ""}
+              </span>
             </div>
             <div className="rowActions">
               <label className="switch"><input type="checkbox" checked={item.enabled} onChange={(e) => updateAndSave((c) => ({ ...c, vocabulary: c.vocabulary.map((v) => v.id === item.id ? { ...v, enabled: e.target.checked } : v) }))} /></label>
