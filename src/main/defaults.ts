@@ -564,9 +564,9 @@ export const defaultConfig: AppConfig = {
     localEnginePath: ""
   },
   iflytek: {
-    appId: "1c19f36f",
-    apiKey: "a941b74ddf278f9e12129c6add3cbb67",
-    apiSecret: "ZTlhOTEzMWQyNjRmMTBhNGY4NjRiZjc1"
+    appId: "",
+    apiKey: "",
+    apiSecret: ""
   },
   prompts: defaultPrompts,
   correctionPrompt: `你是语音识别纠错助手，专职发现"因发音相近被识别错"的短词。
