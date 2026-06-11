@@ -34,7 +34,7 @@ type AppStatus =
   | "needs_attention";
 
 type Config = {
-  shortcuts: { dictation: string; question: string };
+  shortcuts: { dictation: string; question: string; clipboardPicker: string };
   model: {
     provider: "none" | "deepseek" | "glm" | "custom";
     baseUrl: string;
@@ -462,7 +462,8 @@ function ShortcutPage(props: {
   const [capturing, setCapturing] = useState<keyof Config["shortcuts"] | null>(null);
   const rows: Array<[keyof Config["shortcuts"], string]> = [
     ["dictation", "语音输入"],
-    ["question", "语音问答"]
+    ["question", "语音问答"],
+    ["clipboardPicker", "剪贴板历史"]
   ];
 
   return (

@@ -18,15 +18,27 @@ import { promisify } from "node:util";
 import { loadConfig, saveConfig } from "./config";
 import {
   AppConfig,
-  AppStatus,
   appStyleMap,
+  AppStatus,
+  defaultConfig,
   defaultPrompts,
   modelPresets,
   POLISH_GUARD_DISPLAY,
-  POLISH_GUARD_PREFIX
+  VocabularyEntry
 } from "./defaults";
-import { startHotkeyWatcher, stopHotkeyWatcher } from "./hotkeys";
+import {
+  startHotkeyWatcher,
+  stopHotkeyWatcher
+} from "./hotkeys";
 import { clearLogs, getLogPath, readLogs, writeLog } from "./logger";
+import {
+  getClipboardHistory,
+  onClipboardHistoryChange,
+  restoreClipboardEntry,
+  startClipboardHistoryWatcher,
+  stopClipboardHistoryWatcher,
+  type ClipboardEntry
+} from "./clipboardHistory";
 import {
   callChatModel,
   cleanupRecordings,
@@ -761,6 +773,107 @@ function createRecorderWindow() {
   });
 }
 
+let clipboardPickerWindow: BrowserWindow | null = null;
+let clipboardPickerReady = false;
+let clipboardPickerHideTimer: NodeJS.Timeout | null = null;
+
+function createClipboardPickerWindow() {
+  if (clipboardPickerWindow) return;
+  // 先用占位尺寸创建，show 之前 positionClipboardPicker 会重新计算
+  clipboardPickerWindow = new BrowserWindow({
+    width: 380,
+    height: 600,
+    show: false,
+    frame: false,
+    transparent: false,
+    resizable: false,
+    movable: false,
+    maximizable: false,
+    minimizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    focusable: true,
+    hasShadow: true,
+    backgroundColor: "#1f2937",
+    webPreferences: {
+      preload: join(__dirname, "../preload/clipboardPicker.js"),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  clipboardPickerWindow.setMenuBarVisibility(false);
+  clipboardPickerWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  clipboardPickerWindow.loadFile(
+    isDev
+      ? join(process.cwd(), "src/recorder/clipboard-picker.html")
+      : join(__dirname, "../recorder/clipboard-picker.html")
+  );
+
+  clipboardPickerWindow.webContents.once("did-finish-load", () => {
+    clipboardPickerReady = true;
+    pushClipboardHistoryToPicker();
+  });
+
+  // 不再用 blur 自动关闭 —— 浮窗里输入框聚焦/失焦的微小切换会误触发关闭，
+  // 改由用户按 Esc 或点击外部时显式关闭。
+  clipboardPickerWindow.on("closed", () => {
+    clipboardPickerWindow = null;
+    clipboardPickerReady = false;
+  });
+
+  // 屏蔽默认的 webContents 事件，让浮窗更稳
+  clipboardPickerWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+}
+
+function pushClipboardHistoryToPicker() {
+  if (!clipboardPickerWindow || !clipboardPickerReady) return;
+  clipboardPickerWindow.webContents.send("clipboard-picker:update", getClipboardHistory());
+}
+
+function showClipboardPicker() {
+  if (!clipboardPickerWindow) createClipboardPickerWindow();
+  const win = clipboardPickerWindow;
+  if (!win) return;
+  positionClipboardPicker();
+  win.show();
+  win.focus();
+  // 推送最新历史
+  if (clipboardPickerReady) pushClipboardHistoryToPicker();
+  else win.webContents.once("did-finish-load", () => pushClipboardHistoryToPicker());
+}
+
+function hideClipboardPicker() {
+  if (!clipboardPickerWindow) return;
+  clipboardPickerWindow.hide();
+}
+
+function toggleClipboardPicker() {
+  if (!clipboardPickerWindow) {
+    showClipboardPicker();
+    return;
+  }
+  if (clipboardPickerWindow.isVisible()) hideClipboardPicker();
+  else showClipboardPicker();
+}
+
+function positionClipboardPicker() {
+  if (!clipboardPickerWindow) return;
+  const win = clipboardPickerWindow;
+  // 找到当前鼠标所在的 display
+  const cursor = screen.getCursorScreenPoint();
+  const display = screen.getDisplayNearestPoint(cursor);
+  const { x, y, width, height } = display.workArea;
+  // 浮窗：宽 380px，贴右边；高度占满工作区（顶部 60px 留空不挡 macOS 菜单栏）
+  const pickerWidth = 380;
+  const topOffset = 60;
+  const sideMargin = 8;
+  const targetX = x + width - pickerWidth - sideMargin;
+  const targetY = y + topOffset;
+  const pickerHeight = height - topOffset;
+  win.setBounds({ x: targetX, y: targetY, width: pickerWidth, height: pickerHeight });
+}
+
 function createTray() {
   const image = nativeImage.createFromPath(assetPath("trayTemplate.png"));
   image.setTemplateImage(true);
@@ -809,6 +922,8 @@ function registerShortcuts() {
   // 同时注册 globalShortcut 以消耗快捷键事件，防止 Ctrl+Q 等系统快捷键被透传
   safeRegister("dictation", config.shortcuts.dictation, () => { /* handled by hotkey watcher */ });
   safeRegister("question", config.shortcuts.question, () => { /* handled by hotkey watcher */ });
+  // 剪贴板历史浮窗快捷键：用户在快捷键页可改，默认 Command+Shift+V
+  safeRegister("clipboardPicker", config.shortcuts.clipboardPicker, () => { toggleClipboardPicker(); });
 
   writeLog(Object.values(results).every(Boolean) ? "info" : "warn", "shortcuts", "快捷键注册完成", {
     shortcuts: config.shortcuts,
@@ -1015,8 +1130,10 @@ async function processAudio(audio: Uint8Array, browserTranscript = "") {
         setStatus("generating", "正在润色文本");
         try {
           const stylePrompt = getAutoDetectedPrompt();
-          // 硬约束（防"答非所问"）+ 用户风格提示词 + 词库后缀
-          const systemPrompt = POLISH_GUARD_PREFIX + stylePrompt + buildVocabularySuffix();
+          // stylePrompt 已经在出厂/迁移时由 withPolishGuard() 拼好硬约束前缀，
+          // 这里不要再叠加 POLISH_GUARD_PREFIX，否则会让约束重复、把风格 prompt 挤远，
+          // 导致疑问句被"组织成清晰的指令"改写成陈述句等回归。
+          const systemPrompt = stylePrompt + buildVocabularySuffix();
           finalText = await callChatModel(
             config,
             systemPrompt,
@@ -1201,8 +1318,8 @@ function setupIpc() {
     if (!profile) return;
     writeLog("info", "review", "切换润色风格", { styleId, name: profile.name });
     try {
-      // 硬约束 + 风格 + 词库
-      const systemPrompt = POLISH_GUARD_PREFIX + profile.prompts.polish + buildVocabularySuffix();
+      // profile.prompts.polish 已经由 withPolishGuard() 拼好硬约束，不要再叠加。
+      const systemPrompt = profile.prompts.polish + buildVocabularySuffix();
       const polished = await callChatModel(
         config,
         systemPrompt,
@@ -1219,6 +1336,21 @@ function setupIpc() {
     const height = Math.min(460, Math.max(180, Math.round(size.height)));
     reviewWindow.setSize(width, height, false);
   });
+  // 剪贴板浮窗
+  ipcMain.on("clipboard-picker:pick", (_event, payload: { id: string }) => {
+    if (!payload?.id) return;
+    const entry = restoreClipboardEntry(payload.id);
+    if (entry) {
+      writeLog("info", "clipboard-history", "浮窗选中条目已复制回剪贴板", { id: entry.id, length: entry.text.length });
+      // 闪一下通知（toast-like），这里直接复用 vocabToast 风格的通知
+      notify("已复制到剪贴板", entry.text.length > 60 ? entry.text.slice(0, 60) + "…" : entry.text);
+    }
+    hideClipboardPicker();
+  });
+  ipcMain.on("clipboard-picker:close", () => {
+    hideClipboardPicker();
+  });
+  ipcMain.handle("clipboard:history:get", () => getClipboardHistory());
   ipcMain.on("recorder:started", () => setStatus("recording", "正在接收语音，松开快捷键结束"));
   ipcMain.on("recorder:error", (_event, message: string) => {
     activeMode = null;
@@ -1268,9 +1400,17 @@ app.whenReady().then(async () => {
   createMainWindow();
   createOverlayWindow();
   createRecorderWindow();
+  createClipboardPickerWindow();
   createTray();
   setupPowerEvents();
   registerShortcuts();
+  startClipboardHistoryWatcher();
+  // 把剪贴板历史变化实时推送到浮窗
+  onClipboardHistoryChange(() => {
+    if (clipboardPickerWindow && clipboardPickerWindow.isVisible()) {
+      pushClipboardHistoryToPicker();
+    }
+  });
   setStatus("idle", "后台待命");
   const permissions = await getPermissions();
   if (permissions.microphone !== "granted" || permissions.accessibility !== "granted") {
@@ -1283,9 +1423,11 @@ app.whenReady().then(async () => {
 
 app.on("will-quit", () => {
   stopHotkeyWatcher();
+  stopClipboardHistoryWatcher();
   globalShortcut.unregisterAll();
   cleanupRecordings();
 });
+
 
 app.on("window-all-closed", () => {
   if (isQuitting) app.quit();

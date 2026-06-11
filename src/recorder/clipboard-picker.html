@@ -1,0 +1,308 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Clipboard History</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --bg-soft: #f9fafb;
+        --bg-strong: #ffffff;
+        --fg: #111827;
+        --muted: #6b7280;
+        --border: #e5e7eb;
+        --hover: #f3f4f6;
+        --active: #dbeafe;
+        --active-fg: #1d4ed8;
+        --shadow: 0 10px 30px rgba(15, 23, 42, 0.18);
+        --code-bg: #f3f4f6;
+        --index-fg: #9ca3af;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #1f2937;
+          --bg-soft: #111827;
+          --bg-strong: #2a2a2c;
+          --fg: #f3f4f6;
+          --muted: #9ca3af;
+          --border: #3a3a3c;
+          --hover: #38383a;
+          --active: #1e40af;
+          --active-fg: #dbeafe;
+          --shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+          --code-bg: #1c1c1e;
+          --index-fg: #6b7280;
+        }
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: var(--bg);
+        color: var(--fg);
+        font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        overflow: hidden;
+      }
+      .shell {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        background: var(--bg);
+        border-left: 1px solid var(--border);
+        box-shadow: var(--shadow);
+        overflow: hidden;
+      }
+      .header {
+        flex-shrink: 0;
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        background: var(--bg-soft);
+      }
+      .header .title {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--fg);
+        flex: 1;
+      }
+      .header .hint {
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .search {
+        flex-shrink: 0;
+        padding: 8px 10px;
+        border-bottom: 1px solid var(--border);
+      }
+      .search input {
+        width: 100%;
+        padding: 6px 10px;
+        font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        background: var(--code-bg);
+        color: var(--fg);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        outline: none;
+      }
+      .search input:focus {
+        border-color: #2563eb;
+      }
+      .list {
+        flex: 1;
+        overflow-y: auto;
+        padding: 4px 0;
+      }
+      .entry {
+        display: grid;
+        grid-template-columns: 28px 1fr;
+        gap: 4px;
+        padding: 8px 12px;
+        cursor: pointer;
+        border-bottom: 1px solid var(--border);
+        align-items: start;
+      }
+      .entry:last-child { border-bottom: none; }
+      .entry:hover { background: var(--hover); }
+      .entry .index {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--index-fg);
+        font-variant-numeric: tabular-nums;
+        text-align: center;
+        padding-top: 2px;
+        user-select: none;
+      }
+      .entry .body {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+      }
+      .entry .text {
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 6em;
+        overflow: hidden;
+        display: -webkit-box;
+        -webkit-line-clamp: 4;
+        -webkit-box-orient: vertical;
+      }
+      .entry .meta {
+        font-size: 11px;
+        color: var(--muted);
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      .entry .meta .kind {
+        padding: 1px 6px;
+        border-radius: 3px;
+        background: var(--code-bg);
+        color: var(--muted);
+        font-size: 10px;
+        text-transform: uppercase;
+      }
+      .entry .thumb {
+        max-width: 100%;
+        max-height: 120px;
+        object-fit: contain;
+        background: var(--code-bg);
+        border-radius: 4px;
+        border: 1px solid var(--border);
+      }
+      .empty {
+        padding: 24px 12px;
+        text-align: center;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="header">
+        <div class="title">剪贴板历史</div>
+        <div class="hint">0-9 选中 · Enter 复制 · Esc 关闭</div>
+      </div>
+      <div class="search">
+        <input id="search" placeholder="搜索" />
+      </div>
+      <div class="list" id="list"></div>
+    </div>
+
+    <script>
+      const api = window.clipboardPicker;
+      const listEl = document.getElementById("list");
+      const searchEl = document.getElementById("search");
+
+      let all = [];
+      let filtered = [];
+      let lastQuery = "";
+
+      function escapeHtml(text) {
+        return text
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
+      }
+
+      function formatRelativeTime(ts) {
+        const delta = Date.now() - ts;
+        if (delta < 60_000) return "刚刚";
+        if (delta < 3_600_000) return `${Math.floor(delta / 60_000)} 分钟前`;
+        if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)} 小时前`;
+        return new Date(ts).toLocaleString();
+      }
+
+      function renderEntryText(entry) {
+        // 文本类直接显示；HTML/RTF 显示提示 + 纯文本
+        if (entry.kind === "text") return escapeHtml(entry.text);
+        if (entry.kind === "html") {
+          const fallback = entry.text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+          return escapeHtml(fallback.slice(0, 200)) + (fallback.length > 200 ? "…" : "");
+        }
+        if (entry.kind === "rtf") {
+          // RTF 没法直接显示成纯文本，截前 200 字符
+          return escapeHtml(entry.text.slice(0, 200)) + (entry.text.length > 200 ? "…" : "");
+        }
+        return "";
+      }
+
+      function render() {
+        const q = lastQuery.toLowerCase();
+        filtered = q
+          ? all.filter((e) => {
+              if (e.kind === "image") return false; // 图片不支持搜索
+              return e.text.toLowerCase().includes(q);
+            })
+          : all;
+
+        if (filtered.length === 0) {
+          listEl.innerHTML = `<div class="empty">${
+            q ? "没有匹配的剪贴板记录" : "还没有剪贴板记录。在任意 App 里 Cmd+C 复制内容就会出现在这里。"
+          }</div>`;
+          return;
+        }
+
+        const html = filtered
+          .map((e, i) => {
+            const showIndex = i < 10; // 只给前 10 条显示 0-9 序号
+            const indexLabel = showIndex ? `${i}` : "";
+            const time = e.lastUsedAt && e.lastUsedAt !== e.createdAt
+              ? `复制于 ${formatRelativeTime(e.lastUsedAt)}`
+              : formatRelativeTime(e.createdAt);
+            let bodyInner = "";
+            if (e.kind === "image") {
+              bodyInner = `<img class="thumb" src="${e.imageDataUrl}" alt="图片" />`;
+            } else {
+              bodyInner = `<div class="text">${renderEntryText(e)}</div>`;
+            }
+            const kindLabel = e.kind === "text" ? "文本" : e.kind === "html" ? "HTML" : e.kind === "rtf" ? "RTF" : "图片";
+            return `<div class="entry" data-id="${e.id}">
+              <div class="index">${indexLabel}</div>
+              <div class="body">
+                ${bodyInner}
+                <div class="meta"><span class="kind">${kindLabel}</span><span>${escapeHtml(time)}</span></div>
+              </div>
+            </div>`;
+          })
+          .join("");
+        listEl.innerHTML = html;
+      }
+
+      // 点击条目
+      listEl.addEventListener("click", (event) => {
+        const target = event.target.closest(".entry");
+        if (!target) return;
+        const id = target.dataset.id;
+        if (id) api.pick(id);
+      });
+
+      // 搜索
+      searchEl.addEventListener("input", () => {
+        lastQuery = searchEl.value.trim();
+        render();
+      });
+
+      // 键盘：0-9 选前 10 条；Enter 选第一条；Esc 关闭
+      document.addEventListener("keydown", (event) => {
+        // 让搜索框里的常规输入正常工作
+        const target = event.target;
+        if (target && target.tagName === "INPUT") {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            api.close();
+            return;
+          }
+          return; // 其他按键在 input 里直接走默认
+        }
+        if (event.key === "Escape") {
+          event.preventDefault();
+          api.close();
+        } else if (event.key === "Enter") {
+          event.preventDefault();
+          const first = filtered[0];
+          if (first) api.pick(first.id);
+        } else if (/^[0-9]$/.test(event.key)) {
+          const idx = Number(event.key);
+          if (idx < filtered.length) {
+            event.preventDefault();
+            api.pick(filtered[idx].id);
+          }
+        }
+      });
+
+      api.onUpdate((entries) => {
+        all = entries || [];
+        render();
+      });
+
+      // 自动聚焦搜索框
+      setTimeout(() => searchEl.focus(), 30);
+    </script>
+  </body>
+</html>

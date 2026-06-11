@@ -10,6 +10,7 @@ export type AppStatus =
 export type ShortcutConfig = {
   dictation: string;
   question: string;
+  clipboardPicker: string;
 };
 
 export type ModelConfig = {
@@ -543,8 +544,9 @@ export const modelPresets: Record<string, Partial<ModelConfig>> = {
 
 export const defaultConfig: AppConfig = {
   shortcuts: {
-    dictation: "Control+Shift+Space",
-    question: "Control+Shift+."
+    dictation: "Control+Q",
+    question: "Control+W",
+    clipboardPicker: "Command+Shift+V"
   },
   model: {
     provider: "none",
