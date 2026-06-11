@@ -27,7 +27,8 @@ import {
   getPermissions,
   openPermissionSettings,
   requestMicrophone,
-  transcribeAudio
+  transcribeAudio,
+  wrapPolishContent
 } from "./services";
 
 let mainWindow: BrowserWindow | null = null;
@@ -840,7 +841,7 @@ async function processAudio(audio: Uint8Array, browserTranscript = "") {
           finalText = await callChatModel(
             config,
             prompt + buildVocabularySuffix(),
-            rawText
+            wrapPolishContent(rawText)
           );
           polishMs = Date.now() - tPolishStart;
           writeLog("info", "timing", "润色阶段", { elapsedMs: polishMs, characters: finalText.length });
@@ -1023,7 +1024,7 @@ function setupIpc() {
       const polished = await callChatModel(
         config,
         profile.prompts.polish + buildVocabularySuffix(),
-        reviewRawText
+        wrapPolishContent(reviewRawText)
       );
       reviewWindow.webContents.send("review:update-text", polished);
     } catch (error) {

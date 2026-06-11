@@ -2,7 +2,7 @@ import { app } from "electron";
 import { mkdirSync, readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { AppConfig, defaultConfig, promptProfiles, PromptProfile } from "./defaults";
+import { AppConfig, defaultConfig, promptProfiles, PromptProfile, withPolishGuard } from "./defaults";
 
 const configPath = () => join(app.getPath("userData"), "config.json");
 
@@ -57,7 +57,10 @@ function normalizePromptProfiles(input: PromptProfile[] | undefined, _fallback: 
     name: profile.name?.trim() || `提示词 ${index + 1}`,
     prompts: {
       ...defaultConfig.prompts,
-      ...profile.prompts
+      ...profile.prompts,
+      // 老用户升级时，他们的 polish prompt 可能是旧版（没有硬约束前缀）。
+      // 统一包一层，确保防"答非所问"的兜底对所有用户生效。
+      polish: withPolishGuard(profile.prompts?.polish || defaultConfig.prompts.polish)
     }
   }));
 }
