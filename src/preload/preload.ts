@@ -11,7 +11,6 @@ contextBridge.exposeInMainWorld("aiVoiceInput", {
   getModelPresets: () => ipcRenderer.invoke("model:presets"),
   testModel: (config: unknown) => ipcRenderer.invoke("model:test", config),
   getDefaultPrompts: () => ipcRenderer.invoke("prompts:defaults"),
-  getPolishGuard: () => ipcRenderer.invoke("prompts:polish-guard"),
   listLogs: () => ipcRenderer.invoke("logs:list"),
   clearLogs: () => ipcRenderer.invoke("logs:clear"),
   getLogPath: () => ipcRenderer.invoke("logs:path"),

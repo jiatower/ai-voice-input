@@ -18,12 +18,12 @@ import { promisify } from "node:util";
 import { loadConfig, saveConfig } from "./config";
 import {
   AppConfig,
-  appStyleMap,
   AppStatus,
   defaultConfig,
-  defaultPrompts,
+  defaultCorrectionPrompt,
+  defaultPolishPrompt,
+  defaultQaPrompt,
   modelPresets,
-  POLISH_GUARD_DISPLAY,
   VocabularyEntry
 } from "./defaults";
 import {
@@ -34,6 +34,7 @@ import { clearLogs, getLogPath, readLogs, writeLog } from "./logger";
 import {
   getClipboardHistory,
   onClipboardHistoryChange,
+  removeClipboardEntry,
   restoreClipboardEntry,
   startClipboardHistoryWatcher,
   stopClipboardHistoryWatcher,
@@ -65,7 +66,6 @@ let config: AppConfig = loadConfig();
 let status: AppStatus = "idle";
 let activeMode: "dictation" | "question" | null = null;
 let recordingStartedAt = 0;
-let recordingFrontApp = "";
 let recoveryTimer: NodeJS.Timeout | null = null;
 let isQuitting = false;
 let recorderReady = false;
@@ -238,10 +238,9 @@ function escapeHtml(value: string) {
     .replace(/'/g, "&#039;");
 }
 
-function showReviewWindow(text: string, rawText: string, audioPath?: string, styleId?: string): Promise<ReviewResolution> {
+function showReviewWindow(text: string, rawText: string, audioPath?: string, _styleId?: string): Promise<ReviewResolution> {
   writeLog("info", "review", "准备弹出校对窗", { textLen: text.length, hasAudio: !!audioPath });
   reviewRawText = rawText;
-  const currentStyleId = styleId || config.activePromptProfileId;
   const prevResolve = reviewResolve;
   reviewResolve = null;
   if (reviewWindow) {
@@ -328,8 +327,8 @@ body{margin:0;background:transparent;font-family:-apple-system,BlinkMacSystemFon
 .btn-confirm{background:#2563eb;color:#fff}.btn-confirm:hover{background:#1d4ed8}
 .btn-skip{background:#eef2f7;color:#475467}.btn-skip:hover{background:#dbeafe}
 .btn-play{background:#eef2f7;color:#475467;width:26px;min-width:26px;padding:0}.btn-play:hover{background:#fef3c7;color:#92400e}
-.styleSelect{-webkit-app-region:no-drag;height:26px;border:1px solid #d0d5dd;border-radius:5px;background:#fff;color:#475467;font-size:11px;padding:0 4px;outline:none;cursor:pointer;max-width:100px}
-.styleSelect:focus{border-color:#2563eb}
+.btn-restyle{background:#eef2f7;color:#475467;width:26px;min-width:26px;padding:0;font-size:14px;line-height:1}.btn-restyle:hover{background:#dbeafe;color:#1d4ed8}
+.btn-restyle:disabled{opacity:.5;cursor:not-allowed}
 .body{flex:1;padding:8px 10px;display:flex;flex-direction:column;min-height:0}
 textarea{flex:1;border:1px solid #d0d5dd;border-radius:8px;padding:10px;font-size:14px;font-family:inherit;resize:none;outline:none;line-height:1.55;color:#18202f;min-height:0;box-sizing:border-box}
 textarea:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.12)}
@@ -341,9 +340,7 @@ textarea:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.12)}
   <div class="bar">
     <div><span class="title">校对文本</span><span class="hint"> \u00b7 Enter \u786e\u8ba4 \u00b7 Esc \u8df3\u8fc7</span></div>
     <div class="actions">
-      <select id="styleSelect" class="styleSelect" title="切换润色风格">
-        ${config.promptProfiles.map((p) => `<option value="${escapeHtml(p.id)}" ${p.id === currentStyleId ? "selected" : ""}>${escapeHtml(p.name)}</option>`).join("")}
-      </select>
+      <button class="btn btn-restyle" id="restyle" title="用最新提示词重新润色">\u21bb</button>
       ${audioPath ? `<button class="btn btn-play" id="play" data-audio="${escapeHtml(audioPath)}" title="播放录音">\u25b6</button>` : ""}
       <button class="btn btn-skip" id="skip">\u8df3\u8fc7</button>
       <button class="btn btn-confirm" id="confirm">\u786e\u8ba4</button>
@@ -358,11 +355,17 @@ editor.focus();
 editor.setSelectionRange(editor.value.length, editor.value.length);
 document.getElementById("confirm").addEventListener("click", () => ipcRenderer.send("review-window:confirm", editor.value));
 document.getElementById("skip").addEventListener("click", () => ipcRenderer.send("review-window:skip"));
+const restyleBtn = document.getElementById("restyle");
+let restyling = false;
+restyleBtn.addEventListener("click", () => {
+  if (restyling) return;
+  restyling = true;
+  restyleBtn.disabled = true;
+  ipcRenderer.send("review-window:restyle");
+  setTimeout(() => { restyling = false; restyleBtn.disabled = false; }, 1500);
+});
 ipcRenderer.on("review:update-text", (_event, text) => {
   editor.value = text;
-});
-document.getElementById("styleSelect").addEventListener("change", function () {
-  ipcRenderer.send("review-window:restyle", this.value);
 });
 editor.addEventListener("keydown", (e) => {
   if (e.isComposing) return;
@@ -981,19 +984,6 @@ function setupPowerEvents() {
 
 const execFileAsync = promisify(execFile);
 
-async function getFrontmostApp(): Promise<string> {
-  if (process.platform !== "darwin") return "";
-  try {
-    const { stdout } = await execFileAsync("osascript", [
-      "-e",
-      'tell application "System Events" to get name of first application process whose frontmost is true'
-    ], { timeout: 2000 });
-    return stdout.trim();
-  } catch {
-    return "";
-  }
-}
-
 async function startRecording(mode: "dictation" | "question") {
   // 去抖：globalShortcut 偶发会在一次按键里触发两次 down，相隔 1-3ms，
   // 如果和上一次是同一 mode，直接 return 避免状态闪烁。
@@ -1005,11 +995,6 @@ async function startRecording(mode: "dictation" | "question") {
   lastDownAt = now;
   lastDownMode = mode;
   writeLog("info", "shortcut", "按下快捷键", { mode, status });
-  recordingFrontApp = "";
-  if (config.autoDetectStyle) {
-    recordingFrontApp = await getFrontmostApp();
-    writeLog("info", "style", "检测到前台应用", { app: recordingFrontApp });
-  }
   if (status !== "idle") {
     // 如果上次录音卡在 recording（recorder:stopped 没回来之类的），允许二次按快捷键
     // 强制清理并重新开始 —— 这是兜底，避免状态机永久卡住。
@@ -1071,18 +1056,6 @@ function stopRecording(mode: "dictation" | "question") {
   sendRecorder("recorder:stop");
 }
 
-function getAutoDetectedPrompt(): string {
-  if (!config.autoDetectStyle || !recordingFrontApp) return config.prompts.polish;
-  const styleId = appStyleMap[recordingFrontApp];
-  if (!styleId) return config.prompts.polish;
-  const profile = config.promptProfiles.find((p) => p.id === styleId);
-  if (profile) {
-    writeLog("info", "style", "自动匹配样式", { app: recordingFrontApp, style: styleId });
-    return profile.prompts.polish;
-  }
-  return config.prompts.polish;
-}
-
 function buildVocabularySuffix(): string {
   const enabled = config.vocabulary.filter((v) => v.enabled);
   if (enabled.length === 0) return "";
@@ -1129,10 +1102,8 @@ async function processAudio(audio: Uint8Array, browserTranscript = "") {
         const tPolishStart = Date.now();
         setStatus("generating", "正在润色文本");
         try {
-          const stylePrompt = getAutoDetectedPrompt();
-          // stylePrompt 已经在出厂/迁移时由 withPolishGuard() 拼好硬约束前缀，
-          // 这里不要再叠加 POLISH_GUARD_PREFIX，否则会让约束重复、把风格 prompt 挤远，
-          // 导致疑问句被"组织成清晰的指令"改写成陈述句等回归。
+          const stylePrompt = config.polishPrompt;
+          // 单条 prompt 模式：直接用 config.polishPrompt（不再拼硬约束前缀）
           const systemPrompt = stylePrompt + buildVocabularySuffix();
           finalText = await callChatModel(
             config,
@@ -1158,7 +1129,7 @@ async function processAudio(audio: Uint8Array, browserTranscript = "") {
           writeLog("info", "review", "进入校对流程");
           const tReviewStart = Date.now();
           setStatus("idle", "请校对文本");
-          const result = await showReviewWindow(finalText, rawText, recordedAudioPath, recordingFrontApp ? (appStyleMap[recordingFrontApp] || "") : "");
+          const result = await showReviewWindow(finalText, rawText, recordedAudioPath, "");
           reviewMs = Date.now() - tReviewStart;
           writeLog("info", "timing", "校对阶段", { elapsedMs: reviewMs, action: result.action });
           if (result.action === "confirm") {
@@ -1202,7 +1173,7 @@ async function processAudio(audio: Uint8Array, browserTranscript = "") {
       });
     } else {
       setStatus("answering", "正在生成回答");
-      finalText = await callChatModel(config, config.prompts.qa, rawText);
+      finalText = await callChatModel(config, config.qaPrompt, rawText);
       writeLog("info", "qa", "问答完成", { characters: finalText.length });
       notify("语音问答完成", "回答已在独立窗口中显示");
       showQaWindow(rawText, finalText);
@@ -1276,8 +1247,11 @@ function setupIpc() {
     await callChatModel(next, "你是连接测试助手。只回复 OK。", "请回复 OK");
     return true;
   });
-  ipcMain.handle("prompts:defaults", () => defaultPrompts);
-  ipcMain.handle("prompts:polish-guard", () => POLISH_GUARD_DISPLAY);
+  ipcMain.handle("prompts:defaults", () => ({
+    polish: defaultPolishPrompt,
+    qa: defaultQaPrompt,
+    correction: defaultCorrectionPrompt
+  }));
   ipcMain.handle("window:show", showMainWindow);
   ipcMain.handle("logs:list", () => readLogs());
   ipcMain.handle("logs:clear", () => {
@@ -1314,12 +1288,10 @@ function setupIpc() {
   });
   ipcMain.on("review-window:restyle", async (_event, styleId: string) => {
     if (!reviewWindow || !reviewRawText) return;
-    const profile = config.promptProfiles.find((p) => p.id === styleId);
-    if (!profile) return;
-    writeLog("info", "review", "切换润色风格", { styleId, name: profile.name });
+    writeLog("info", "review", "用最新 polishPrompt 重新润色");
     try {
-      // profile.prompts.polish 已经由 withPolishGuard() 拼好硬约束，不要再叠加。
-      const systemPrompt = profile.prompts.polish + buildVocabularySuffix();
+      // 单条 prompt 模式：直接用 config.polishPrompt（不再拼硬约束前缀）
+      const systemPrompt = config.polishPrompt + buildVocabularySuffix();
       const polished = await callChatModel(
         config,
         systemPrompt,
@@ -1349,6 +1321,13 @@ function setupIpc() {
   });
   ipcMain.on("clipboard-picker:close", () => {
     hideClipboardPicker();
+  });
+  ipcMain.on("clipboard-picker:remove", (_event, payload: { id: string }) => {
+    if (!payload?.id) return;
+    const ok = removeClipboardEntry(payload.id);
+    if (ok) {
+      writeLog("info", "clipboard-history", "浮窗删除单条", { id: payload.id });
+    }
   });
   ipcMain.handle("clipboard:history:get", () => getClipboardHistory());
   ipcMain.on("recorder:started", () => setStatus("recording", "正在接收语音，松开快捷键结束"));

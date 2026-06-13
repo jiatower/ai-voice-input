@@ -5,9 +5,9 @@ import { dirname, join } from "node:path";
 import {
   AppConfig,
   defaultConfig,
-  promptProfiles,
-  PromptProfile,
-  stripPolishGuard,
+  defaultPolishPrompt,
+  defaultQaPrompt,
+  defaultCorrectionPrompt,
   VocabularyEntry
 } from "./defaults";
 
@@ -42,7 +42,7 @@ function migrateVocabulary(input: unknown): VocabularyEntry[] {
   return result;
 }
 
-function mergeConfig(input: Partial<AppConfig>): AppConfig {
+function mergeConfig(input: Partial<AppConfig> & Record<string, unknown>): AppConfig {
   const shortcuts = { ...defaultConfig.shortcuts, ...input.shortcuts };
   if (process.platform === "darwin") {
     for (const key of Object.keys(shortcuts) as Array<keyof typeof shortcuts>) {
@@ -50,12 +50,19 @@ function mergeConfig(input: Partial<AppConfig>): AppConfig {
     }
   }
 
-  const legacyPrompts = { ...defaultConfig.prompts, ...input.prompts };
-  const promptProfiles = normalizePromptProfiles(input.promptProfiles, legacyPrompts);
-  const activePromptProfileId = promptProfiles.some((profile) => profile.id === input.activePromptProfileId)
-    ? input.activePromptProfileId!
-    : promptProfiles[0].id;
-  const activeProfile = promptProfiles.find((profile) => profile.id === activePromptProfileId) ?? promptProfiles[0];
+  // 老用户磁盘上可能还存着 prompts / promptProfiles / activePromptProfileId / autoDetectStyle
+  // 这些字段在新的 AppConfig 里已经不存在了；loadConfig 阶段直接忽略，只在新字段缺失时回退到默认。
+  // 老 polish prompt 可能是"硬约束 + 风格"拼接形式；用户首次启动新版本后会被默认替换，
+  // 用户在 UI 里重新编辑即可。
+  const polishPrompt = typeof input.polishPrompt === "string" && input.polishPrompt
+    ? input.polishPrompt
+    : defaultPolishPrompt;
+  const qaPrompt = typeof input.qaPrompt === "string" && input.qaPrompt
+    ? input.qaPrompt
+    : defaultQaPrompt;
+  const correctionPrompt = typeof input.correctionPrompt === "string" && input.correctionPrompt
+    ? input.correctionPrompt
+    : defaultCorrectionPrompt;
 
   return {
     ...defaultConfig,
@@ -63,43 +70,11 @@ function mergeConfig(input: Partial<AppConfig>): AppConfig {
     shortcuts,
     model: { ...defaultConfig.model, ...input.model },
     speech: { ...defaultConfig.speech, ...input.speech },
-    prompts: activeProfile.prompts,
-    promptProfiles,
-    activePromptProfileId,
+    polishPrompt,
+    qaPrompt,
+    correctionPrompt,
     vocabulary: migrateVocabulary(input.vocabulary)
   };
-}
-
-function normalizePromptProfiles(input: PromptProfile[] | undefined, _fallback: AppConfig["prompts"]): PromptProfile[] {
-  const saved = (Array.isArray(input) && input.length > 0 ? input : []).map((p) => ({
-    id: p.id,
-    name: p.name?.trim() || "",
-    prompts: { ...defaultConfig.prompts, ...p.prompts }
-  }));
-
-  const builtinIds = new Set(promptProfiles.map((p) => p.id));
-  const savedIds = new Set(saved.filter((p) => p.id).map((p) => p.id));
-
-  // 补上缺失的内置预设（不影响用户手动删除的，通过判断 savedIds 里是否有同 id 的）
-  const result = [...saved];
-  for (const builtin of promptProfiles) {
-    if (!savedIds.has(builtin.id)) {
-      result.push({ ...builtin, prompts: { ...builtin.prompts } });
-    }
-  }
-
-  return result.map((profile, index) => ({
-    id: profile.id || `prompt-${index + 1}`,
-    name: profile.name?.trim() || `提示词 ${index + 1}`,
-    prompts: {
-      ...defaultConfig.prompts,
-      ...profile.prompts,
-      // 老用户升级时，他们的 polish prompt 可能是"硬约束 + 风格"的拼接形式。
-      // 剥离开头可能存在的硬约束前缀（基于 hash 标记），只保留"风格"部分。
-      // 硬约束会在调用 LLM 时由代码显式拼接，不再混入用户可编辑区域。
-      polish: stripPolishGuard(profile.prompts?.polish || defaultConfig.prompts.polish)
-    }
-  }));
 }
 
 export function loadConfig(): AppConfig {

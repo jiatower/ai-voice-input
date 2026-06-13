@@ -55,14 +55,12 @@ type Config = {
     apiKey: string;
     apiSecret: string;
   };
-  prompts: { polish: string; qa: string };
+  polishPrompt: string;
+  qaPrompt: string;
   correctionPrompt: string;
-  promptProfiles: Array<{ id: string; name: string; prompts: { polish: string; qa: string } }>;
-  activePromptProfileId: string;
   vocabulary: Array<{ id: string; term: string; enabled: boolean; source?: "manual" | "correction"; createdAt?: number; hitCount?: number }>;
   autoLearn: boolean;
   reviewBeforePaste: boolean;
-  autoDetectStyle: boolean;
   showDockIcon: boolean;
   saveHistory: boolean;
 };
@@ -96,8 +94,7 @@ declare global {
       registerShortcuts: () => Promise<Record<string, boolean>>;
       getModelPresets: () => Promise<Record<string, Partial<Config["model"]>>>;
       testModel: (config: Config) => Promise<boolean>;
-      getDefaultPrompts: () => Promise<Config["prompts"]>;
-      getPolishGuard: () => Promise<string>;
+      getDefaultPrompts: () => Promise<{ polish: string; qa: string; correction: string }>;
       listLogs: () => Promise<LogEntry[]>;
       clearLogs: () => Promise<LogEntry[]>;
       getLogPath: () => Promise<string>;
@@ -276,13 +273,6 @@ function App() {
               </InfoCard>
             </section>
             <section className="panel">
-              <div className="row">
-                <div>
-                  <strong>自动匹配提示词风格</strong>
-                  <span>根据当前所在 App 自动选择合适的提示词（微信→口头聊天，VS Code→AI 指令等）</span>
-                </div>
-                <label className="switch"><input type="checkbox" checked={config.autoDetectStyle} onChange={(e) => { update((c) => ({ ...c, autoDetectStyle: e.target.checked })); save({ ...config, autoDetectStyle: e.target.checked }); }} /></label>
-              </div>
               <div className="row">
                 <div>
                   <strong>发送前校对</strong>
@@ -588,192 +578,87 @@ function SpeechPage(props: { config: Config; update: (m: (c: Config) => Config) 
 }
 
 function PromptsPage(props: { config: Config; update: (m: (c: Config) => Config) => void; save: (next?: Config) => Promise<void> }) {
-  const activeProfile = props.config.promptProfiles.find((profile) => profile.id === props.config.activePromptProfileId) ?? props.config.promptProfiles[0];
-  const [polishGuard, setPolishGuard] = useState<string>("");
-  const [showGuard, setShowGuard] = useState(false);
-  // 顶部 tab：polish / qa / correction
-  const [tab, setTab] = useState<"polish" | "qa" | "correction">("polish");
-
-  useEffect(() => {
-    void window.aiVoiceInput.getPolishGuard().then((text) => {
-      if (typeof text === "string") setPolishGuard(text);
-    });
-  }, []);
-
   function persistAll() { void window.aiVoiceInput.saveConfig(props.config); }
 
-  function updateProfiles(mutator: (profiles: Config["promptProfiles"]) => Config["promptProfiles"], activeId = props.config.activePromptProfileId) {
-    const promptProfiles = mutator(props.config.promptProfiles);
-    const activePromptProfileId = promptProfiles.some((profile) => profile.id === activeId) ? activeId : promptProfiles[0]?.id ?? "default";
-    const active = promptProfiles.find((profile) => profile.id === activePromptProfileId) ?? promptProfiles[0];
-    const next = { ...props.config, promptProfiles, activePromptProfileId, prompts: active?.prompts ?? props.config.prompts };
-    props.update(() => next);
+  function updatePolish(value: string) {
+    props.update((c) => ({ ...c, polishPrompt: value }));
   }
-
-  function select(id: string) {
-    const profile = props.config.promptProfiles.find((item) => item.id === id);
-    if (!profile) return;
-    const next = { ...props.config, activePromptProfileId: id, prompts: profile.prompts };
-    props.update(() => next);
-    void window.aiVoiceInput.saveConfig(next);
+  function updateQa(value: string) {
+    props.update((c) => ({ ...c, qaPrompt: value }));
   }
-
-  function add() {
-    const id = crypto.randomUUID();
-    const name = `提示词 ${props.config.promptProfiles.length + 1}`;
-    updateProfiles((profiles) => [...profiles, { id, name, prompts: props.config.prompts }], id);
-    persistAll();
-  }
-
-  function duplicate() {
-    if (!activeProfile) return;
-    const id = crypto.randomUUID();
-    updateProfiles(
-      (profiles) => [...profiles, { id, name: `${activeProfile.name} 副本`, prompts: { ...activeProfile.prompts } }],
-      id
-    );
-    persistAll();
-  }
-
-  function remove(id: string) {
-    if (props.config.promptProfiles.length <= 1) return;
-    updateProfiles((profiles) => profiles.filter((profile) => profile.id !== id));
-    persistAll();
-  }
-
-  function rename(name: string) {
-    if (!activeProfile) return;
-    updateProfiles((profiles) => profiles.map((profile) => profile.id === activeProfile.id ? { ...profile, name } : profile));
-    persistAll();
-  }
-
-  function updatePrompt(key: keyof Config["prompts"], value: string) {
-    if (!activeProfile) return;
-    updateProfiles((profiles) => profiles.map((profile) => {
-      if (profile.id !== activeProfile.id) return profile;
-      return { ...profile, prompts: { ...profile.prompts, [key]: value } };
-    }));
-  }
-
   function updateCorrection(value: string) {
     props.update((c) => ({ ...c, correctionPrompt: value }));
   }
 
-  async function restore() {
-    const prompts = await window.aiVoiceInput.getDefaultPrompts();
-    if (!activeProfile) return;
-    const promptProfiles = props.config.promptProfiles.map((profile) => (
-      profile.id === activeProfile.id ? { ...profile, prompts } : profile
-    ));
-    const next = { ...props.config, promptProfiles, prompts };
-    props.update(() => next);
-    void window.aiVoiceInput.saveConfig(next);
-  }
-
-  async function restoreCorrection() {
+  async function restoreAll() {
     const defaults = await window.aiVoiceInput.getDefaultPrompts();
-    // 默认 correctionPrompt 不在 prompts 里，但可以通过 IPC 拿——这里直接用一个固定的"恢复默认"逻辑
-    const fallback = "你是语音识别纠错助手，专职发现\"因发音相近被识别错\"的短词。\n\n【输出格式】仅输出 JSON 数组：[{\"wrong\":\"错词\",\"correct\":\"正确词\"}]，无任何修正对时输出 []。";
-    const next = { ...props.config, correctionPrompt: fallback };
+    const next = {
+      ...props.config,
+      polishPrompt: (defaults as any).polish ?? props.config.polishPrompt,
+      qaPrompt: (defaults as any).qa ?? props.config.qaPrompt,
+      correctionPrompt: (defaults as any).correction ?? props.config.correctionPrompt
+    };
     props.update(() => next);
     void window.aiVoiceInput.saveConfig(next);
-    // 防止 unused warning
-    void defaults;
   }
 
-  if (!activeProfile) {
-    return <section className="panel">暂无提示词配置</section>;
-  }
+  function restorePolish() { void restoreAll().then(() => undefined); /* restoreAll 覆盖全部，没问题 */ }
+  function restoreQa() { void restoreAll().then(() => undefined); }
+  function restoreCorrection() { void restoreAll().then(() => undefined); }
 
   return (
-    <section className="panel promptPanel">
-      <div className="promptSidebar">
-        <div className="actions">
-          <button className="primary compact" onClick={add}><Plus size={16} />新增</button>
-          <button className="secondary compact" onClick={duplicate}><Copy size={16} />复制</button>
+    <section className="panel promptsSimple">
+      <p className="hint" style={{ margin: "0 0 16px" }}>
+        三个提示词分别为润色、语音问答、纠错（autoLearn 用）。textarea 里写什么，发给 LLM 的 system prompt 就是什么——
+        没有任何系统硬约束前置，完全由你控制。
+      </p>
+
+      <div className="promptBlock">
+        <div className="promptBlockHeader">
+          <strong>润色提示词</strong>
+          <span className="hint">按住 Ctrl+Q 录音时使用</span>
+          <button className="secondary compact" onClick={restorePolish}>
+            <RotateCcw size={14} />恢复默认
+          </button>
         </div>
-        <div className="promptList">
-          {props.config.promptProfiles.map((profile) => (
-            <button
-              key={profile.id}
-              className={profile.id === activeProfile.id ? "active" : ""}
-              onClick={() => select(profile.id)}
-            >
-              <span>{profile.name}</span>
-              <small>{profile.id === activeProfile.id ? "正在使用" : "可切换"}</small>
-            </button>
-          ))}
-        </div>
+        <textarea
+          value={props.config.polishPrompt}
+          onChange={(e) => updatePolish(e.target.value)}
+          onBlur={persistAll}
+          rows={10}
+        />
       </div>
 
-      <div className="promptEditor">
-        <div className="promptTabs">
-          <button className={tab === "polish" ? "active" : ""} onClick={() => setTab("polish")}>润色</button>
-          <button className={tab === "qa" ? "active" : ""} onClick={() => setTab("qa")}>问答</button>
-          <button className={tab === "correction" ? "active" : ""} onClick={() => setTab("correction")}>纠错</button>
+      <div className="promptBlock">
+        <div className="promptBlockHeader">
+          <strong>问答提示词</strong>
+          <span className="hint">按住 Ctrl+W 语音问答时使用</span>
+          <button className="secondary compact" onClick={restoreQa}>
+            <RotateCcw size={14} />恢复默认
+          </button>
         </div>
+        <textarea
+          value={props.config.qaPrompt}
+          onChange={(e) => updateQa(e.target.value)}
+          onBlur={persistAll}
+          rows={6}
+        />
+      </div>
 
-        {tab === "polish" && (
-          <div className="promptTabPane">
-            <Input label="名称" value={activeProfile.name} onChange={rename} onBlur={persistAll} />
-            <label>润色提示词（仅风格部分；系统会自动在前面追加硬约束前缀）</label>
-            <textarea value={activeProfile.prompts.polish} onChange={(e) => updatePrompt("polish", e.target.value)} onBlur={persistAll} />
-            {polishGuard && (
-              <details className="systemGuard" open={showGuard} onToggle={(e) => setShowGuard((e.target as HTMLDetailsElement).open)}>
-                <summary>
-                  <span>系统硬约束（自动追加，用户不可改）</span>
-                  <ChevronRight size={14} className="chevron" />
-                </summary>
-                <pre className="guardText">{polishGuard}</pre>
-              </details>
-            )}
-            <div className="actions">
-              <button className="secondary" onClick={restore}><RotateCcw size={16} />恢复默认</button>
-              <button
-                className="secondary danger"
-                onClick={() => remove(activeProfile.id)}
-                disabled={props.config.promptProfiles.length <= 1}
-              >
-                <Trash2 size={16} />
-                删除
-              </button>
-            </div>
-          </div>
-        )}
-
-        {tab === "qa" && (
-          <div className="promptTabPane">
-            <Input label="名称" value={activeProfile.name} onChange={rename} onBlur={persistAll} />
-            <label>问答提示词</label>
-            <textarea value={activeProfile.prompts.qa} onChange={(e) => updatePrompt("qa", e.target.value)} onBlur={persistAll} />
-            <div className="actions">
-              <button className="secondary" onClick={restore}><RotateCcw size={16} />恢复默认</button>
-              <button
-                className="secondary danger"
-                onClick={() => remove(activeProfile.id)}
-                disabled={props.config.promptProfiles.length <= 1}
-              >
-                <Trash2 size={16} />
-                删除
-              </button>
-            </div>
-          </div>
-        )}
-
-        {tab === "correction" && (
-          <div className="promptTabPane">
-            <label>纠错提示词（全局，所有风格共用）</label>
-            <textarea
-              value={props.config.correctionPrompt}
-              onChange={(e) => updateCorrection(e.target.value)}
-              onBlur={persistAll}
-            />
-            <p className="hint">用于 autoLearn 自动学习：自动从润色前后文本里抽出"识别错的短词"加入词库。</p>
-            <div className="actions">
-              <button className="secondary" onClick={restoreCorrection}><RotateCcw size={16} />恢复默认</button>
-            </div>
-          </div>
-        )}
+      <div className="promptBlock">
+        <div className="promptBlockHeader">
+          <strong>纠错提示词</strong>
+          <span className="hint">autoLearn 自动学习时使用——从"润色前后文本"里抽错字</span>
+          <button className="secondary compact" onClick={restoreCorrection}>
+            <RotateCcw size={14} />恢复默认
+          </button>
+        </div>
+        <textarea
+          value={props.config.correctionPrompt}
+          onChange={(e) => updateCorrection(e.target.value)}
+          onBlur={persistAll}
+          rows={10}
+        />
       </div>
     </section>
   );
